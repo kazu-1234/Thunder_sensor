@@ -29,27 +29,23 @@ LCDディスプレイ: I2C接続 20x4 キャラクタ液晶
 
 Arduino IDE
 
-rp2040 ボードパッケージをインストールしてください。
-
 Arduino ライブラリ (ライブラリマネージャからインストール)
-
-WiFi
-
-HTTPClient
-
-Wire
-
-LiquidCrystal_I2C (お使いのLCDに合わせてください)
-
-WiFiNTP
-
-DFRobot_DHT20
-
-SparkFun_AS3935
-
-ArduinoJson
-
-ArduinoOTA
+WiFi.h
+WiFiServer.h
+WiFiClientSecure.h
+HTTPClient.h
+Wire.h
+LiquidCrystal.h
+time.h
+stdlib.h
+WiFiNTP.h
+DFRobot_DHT20.h
+SparkFun_AS3935.h
+ArduinoJson.h
+WiFiUdp.h
+LittleFS.h
+math.h
+ArduinoOTA.h
 
 2. セットアップ
 ■ ハードウェアの配線
