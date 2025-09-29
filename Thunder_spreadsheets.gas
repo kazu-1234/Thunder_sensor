@@ -1,0 +1,63 @@
+function doGet(e) {
+  try {
+    // Pico Wから送られてくる `sheet` パラメータを取得
+    const sheetName = e.parameter.sheet;
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet;
+
+    // パラメータでシート名が指定されているかチェック
+    if (sheetName) {
+      sheet = spreadsheet.getSheetByName(sheetName);
+      // もしシートが存在しなければ、新しく作成
+      if (!sheet) {
+        sheet = spreadsheet.insertSheet(sheetName);
+        // 新しいシートの種類に応じて、見出し行（ヘッダー）を追加
+        if (sheetName === "温湿度") {
+          sheet.appendRow(["日時", "温度 (°C)", "湿度 (%)"]);
+        } else if (sheetName === "雷の受信履歴") {
+          sheet.appendRow(["日時", "距離 (km)"]);
+        }
+      }
+    } else {
+      // もし `sheet` パラメータがなければ、エラーとして処理
+      return ContentService.createTextOutput(JSON.stringify({
+        "status": "error",
+        "message": "Sheet parameter is missing."
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    const timestamp = new Date();
+
+    // 温湿度データ (`temp`と`hum`) がある場合
+    if (e.parameter.temp !== undefined && e.parameter.hum !== undefined) {
+      sheet.appendRow([timestamp, e.parameter.temp, e.parameter.hum]);
+      return ContentService.createTextOutput(JSON.stringify({
+        "status": "success",
+        "message": "Logged Temp/Hum"
+      })).setMimeType(ContentService.MimeType.JSON);
+
+    // 雷の距離データ (`dist`) がある場合
+    } else if (e.parameter.dist !== undefined) {
+      sheet.appendRow([timestamp, e.parameter.dist]);
+      return ContentService.createTextOutput(JSON.stringify({
+        "status": "success",
+        "message": "Logged Distance"
+      })).setMimeType(ContentService.MimeType.JSON);
+
+    } else {
+      // 記録するべきデータがない場合
+      return ContentService.createTextOutput(JSON.stringify({
+        "status": "error",
+        "message": "No valid data parameters (temp, hum, dist) received."
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+  } catch (error) {
+    // スクリプト実行中に何かエラーが発生した場合
+    return ContentService.createTextOutput(JSON.stringify({
+      "status": "error",
+      "message": error.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+// ===== ここまでがスクリプトの終わりです =====
