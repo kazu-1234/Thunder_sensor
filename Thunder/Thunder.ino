@@ -9,7 +9,6 @@
 #include <LiquidCrystal.h>
 #include <time.h>
 #include <stdlib.h>
-// #include <WiFiNTP.h> // Pico WではWiFi.hに含まれるため不要
 #include <DFRobot_DHT20.h>
 #include <SparkFun_AS3935.h>
 #include <ArduinoJson.h>
@@ -1649,4 +1648,5 @@ void handlePeriodicTasks_Core1() {
         }
     }
 }
+
 
