@@ -1,7 +1,7 @@
 //================================================================
 // ライブラリ
 //================================================================
-#include <WiFi.h> // Raspberry Pi Pico W用のWiFiライブラリ
+#include <WiFi.h>
 #include <WiFiServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -14,36 +14,25 @@
 #include <ArduinoJson.h>
 #include <WiFiUdp.h>
 #include <LittleFS.h>
-#include <math.h> // for round()
-#include <ArduinoOTA.h> // 標準の無線書き込み(OTA)用ライブラリ
-#include "config.h"       // ★★★ 設定ファイルを読み込む
+#include <math.h>
+#include <ArduinoOTA.h>
+#include "config.h"
 
 //================================================================
-// ★★★ 動作設定 (このエリアは編集可能です) ★★★
+// ★★★ 動作設定 ★★★
 //================================================================
-// --- 雷センサー感度設定 ---
-// 各設定値を変更することで、雷の検知感度を調整できます。
-// AUTO_NOISE_LEVEL_CONTROL:
-//   trueにすると、ノイズを検知した際に自動で感度を下げます（誤検知は減りますが、遠雷を逃す可能性も上がります）。
-//   falseにすると、常に設定した感度(INITIAL_NOISE_LEVEL)を維持します（より多くの雷を検知できますが、誤検知も増える可能性があります）。
 const bool AUTO_NOISE_LEVEL_CONTROL = false;
-// LIGHTNING_WATCHDOG_THRESHOLD: 雷と判断するための信号強度の閾値です。(調整範囲: 1～10, 小さいほど高感度)
 const uint8_t LIGHTNING_WATCHDOG_THRESHOLD = 2;
-// LIGHTNING_SPIKE_REJECTION: 電気的スパイクノイズの除去レベルです。(調整範囲: 0～11, 小さいほど高感度)
 const uint8_t LIGHTNING_SPIKE_REJECTION = 2;
-// INITIAL_NOISE_LEVEL: 周囲の環境ノイズレベルの初期値です。(調整範囲: 1～7, 小さいほど高感度)
 const uint8_t INITIAL_NOISE_LEVEL = 2;
-
-// --- 動作設定 ---
 const unsigned long LONG_PRESS_DURATION_MS = 1000;
 const unsigned long INACTIVITY_TIMEOUT_MS = 5000;
 const unsigned long BACKLIGHT_DURATION_MS = 3000;
 const unsigned long IP_DISPLAY_DURATION_MS = 5000;
-const unsigned long ACTION_RESULT_DISPLAY_MS = 2000; // アクション結果の表示時間
+const unsigned long ACTION_RESULT_DISPLAY_MS = 2000;
 const int HISTORY_SIZE = 3;
 const int LCD_COLS = 20;
 const int LCD_ROWS = 4;
-
 
 //================================================================
 // ピン定義
@@ -62,94 +51,26 @@ const int AS3935_ADDR = 0x03;
 // グローバル状態管理
 //================================================================
 namespace State {
-// --- 動作モード ---
-enum Mode {
-    MAIN_DISPLAY, MENU, HISTORY, SWITCHBOT_APPLIANCE_SELECT,
-    DEVICE_CONTROL, WAKE_ON_LAN, ULTRASONIC_MONITOR, SENSOR_DIAGNOSTICS
-};
+enum Mode { MAIN_DISPLAY, MENU, HISTORY, SWITCHBOT_APPLIANCE_SELECT, DEVICE_CONTROL, WAKE_ON_LAN, ULTRASONIC_MONITOR, SENSOR_DIAGNOSTICS };
 
-// --- メニューの状態 ---
-struct MenuState {
-    Mode currentMode = MAIN_DISPLAY;
-    int menuSelection = 0;
-    int deviceSelection = 0;
-    int commandSelection = 0;
-};
-
-// --- システムの状態 ---
-struct SystemState {
-    bool illuminationOn = false;
-    bool backlightAlwaysOn = false;
-    bool ntpInitialized = false;
-    bool isAutoResync = false;
-    bool needsRedraw = true;
-    bool forceMainScreenRedraw = true;
-    uint8_t currentNoiseLevel = 2;
-    bool initialLogSent = false;
-    bool otaInitialized = false; // OTA初期化フラグ
-};
-
-// --- センサーデータ ---
-struct SensorData {
-    float temperature = -999.0;
-    float humidity = -999.0;
-    float ultrasonicDistance = -1.0;
-    char lastEventTime[20] = "N/A";
-    String lastEventType = "None"; // "Lightning" or "Noise"
-    int lastLightningDistance = -1;
-};
-
-// --- 本体メモリに記録する雷履歴 ---
-struct EventRecord {
-    char timestamp[20];
-    String type;
-    int distance;
-};
-
-struct HistoryState {
-    EventRecord records[HISTORY_SIZE];
-    int index = 0;
-    int count = 0;
-};
-
-
-// --- タイマー ---
-struct TimerState {
-    unsigned long lastActivity = 0;
-    unsigned long backlightOn = 0;
-};
-
-// --- 暗号化コンテキスト ---
+struct MenuState { Mode currentMode = MAIN_DISPLAY; int menuSelection = 0; int deviceSelection = 0; int commandSelection = 0; };
+struct SystemState { bool illuminationOn = false; bool backlightAlwaysOn = false; bool ntpInitialized = false; bool isAutoResync = false; bool needsRedraw = true; bool forceMainScreenRedraw = true; uint8_t currentNoiseLevel = 2; bool initialLogSent = false; bool otaInitialized = false; };
+struct SensorData { float temperature = -999.0; float humidity = -999.0; float ultrasonicDistance = -1.0; char lastEventTime[20] = "N/A"; char lastEventType[10] = "None"; int lastLightningDistance = -1; };
+struct EventRecord { char timestamp[20]; char type[10]; int distance; };
+struct HistoryState { EventRecord records[HISTORY_SIZE]; int index = 0; int count = 0; };
+struct TimerState { unsigned long lastActivity = 0; unsigned long backlightOn = 0; };
 struct SHA256_CTX { uint8_t data[64]; uint32_t datalen; uint64_t bitlen; uint32_t state[8]; };
 
-
-// --- グローバルオブジェクトと状態変数のインスタンス ---
-MenuState menu;
-SystemState system;
-SensorData sensors;
-HistoryState history;
-TimerState timers;
-
+MenuState menu; SystemState system; SensorData sensors; HistoryState history; TimerState timers;
 LiquidCrystal lcd(Pins::LCD_RS, Pins::LCD_E, Pins::LCD_D4, Pins::LCD_D5, Pins::LCD_D6, Pins::LCD_D7);
-DFRobot_DHT20 dht20;
-SparkFun_AS3935 lightning(Pins::AS3935_ADDR);
-WiFiServer server(80);
-String childIpAddress = "";
-volatile bool lightningInterruptFlag = false;
-// ★★★ マルチコア間でWi-Fi接続状態を共有するためのフラグ ★★★
-// volatileキーワードは、コンパイラの最適化によって変数が無視されるのを防ぎます
-volatile bool g_wifiConnected = false;
-volatile bool g_wolTriggered = false;
+DFRobot_DHT20 dht20; SparkFun_AS3935 lightning(Pins::AS3935_ADDR); WiFiServer server(80);
+String childIpAddress = ""; volatile bool lightningInterruptFlag = false;
+volatile bool g_wifiConnected = false, g_wolTriggered = false, g_trigger_dht_read = false, g_trigger_wol_poll = false, g_pending_lightning_log_core1 = false, g_update_sensor_display = false;
 volatile byte g_wolTarget = 0;
-volatile bool g_trigger_dht_read = false;
-volatile bool g_trigger_wol_poll = false;
-volatile bool g_pending_lightning_log_core1 = false;
-volatile bool g_update_sensor_display = false;
-
 }
 
 //================================================================
-// 暗号化ユーティリティ (編集不要)
+// 暗号化ユーティリティ
 //================================================================
 namespace Crypto {
 const uint32_t K[64] = {0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
@@ -222,42 +143,11 @@ String base64_encode(const uint8_t *data, size_t len) {
 // プロトタイプ宣言
 //================================================================
 namespace Menu { void changeMode(State::Mode newMode); }
-namespace Display {
-    void triggerWolMessage(byte target);
-    void printLcdLine(int line, const char* text);
-    void updateMainDisplay();
-}
-namespace Network {
-void resyncNtpTimeFromMenu();
-void sendSwitchBotCommand(const char* deviceId, const char* command, const char* parameter, const char* commandType = "command");
-void resyncNtpTime();
-void getSwitchBotDeviceList();
-void sendLineTestMessage();
-void sendWakeOnLan(const byte mac[6]);
-bool sendWakeOnLanPacket(const byte mac[6]);
-void requestDistance();
-void showIpAddressAndHold();
-void logDataToGoogleSheet(const char* params);
-void manualLogToSheet();
-void pollGasForWol();
-void initOTA();
-void handleNtpSync();
-void urlEncode(const char* msg, char* encodedMsg, size_t bufferSize);
-void createTempHumParams(char* buffer, size_t bufferSize);
-}
-namespace Utils {
-    void toggleBacklightMode();
-    void toggleIlluminationMode();
-    void rebootDevice();
-    bool parseMacAddress(const char* macStr, byte* macArray);
-}
-namespace Sensors {
-    void calibrateSensor();
-    void updateDht();
-}
-void handlePeriodicTasks_Core1();
-void setup1();
-void loop1();
+namespace Display { void triggerWolMessage(byte target); void printLcdLine(int line, const char* text); void updateMainDisplay(); void safeClear(); }
+namespace Network { void resyncNtpTime(); void getSwitchBotDeviceList(); void sendLineTestMessage(); void sendWakeOnLan(const char* macStr); void requestDistance(); void showIpAddressAndHold(); void manualLogToSheet(); void pollGasForWol(); void handleNtpSync(); void executeSwitchBotCommand(int deviceIndex, int commandIndex); }
+namespace Utils { void toggleBacklightMode(); void toggleIlluminationMode(); void rebootDevice(); }
+namespace Sensors { void calibrateSensor(); void updateDht(); }
+void setup1(); void loop1(); void handlePeriodicTasks_Core1();
 
 //================================================================
 // メニュー定義
@@ -265,122 +155,64 @@ void loop1();
 namespace Menu {
 struct MenuItem { const char* text; void (*action)(); };
 void performMenuAction(void (*action)(), bool returnToMain);
+void performSwitchBotAction();
 
 void enterHistory() { changeMode(State::HISTORY); }
 void enterSwitchbotMenu() { changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }
 void enterWakeOnLan() { changeMode(State::WAKE_ON_LAN); }
 void enterUltrasonic() { changeMode(State::ULTRASONIC_MONITOR); }
 void enterDiagnostics() { changeMode(State::SENSOR_DIAGNOSTICS); }
-void enterDeviceControl() {
-    State::menu.deviceSelection = State::menu.menuSelection;
-    State::menu.commandSelection = 0;
-    changeMode(State::DEVICE_CONTROL);
-}
+void enterDeviceControl() { State::menu.deviceSelection = State::menu.menuSelection; State::menu.commandSelection = 0; changeMode(State::DEVICE_CONTROL); }
 
 const MenuItem mainMenu[] = {
-    {"1. Lightning Log", enterHistory},
-    {"2. Device Control", enterSwitchbotMenu},
-    {"3. Wake on LAN", enterWakeOnLan},
+    {"1. Lightning Log", enterHistory}, {"2. Device Control", enterSwitchbotMenu}, {"3. Wake on LAN", enterWakeOnLan},
     {"4. Backlight Mode", [](){ performMenuAction(Utils::toggleBacklightMode, true); }},
     {"5. RGB Illumination", [](){ performMenuAction(Utils::toggleIlluminationMode, true); }},
-    {"6. Measure Dist", enterUltrasonic},
-    {"7. Resync Time", [](){ performMenuAction(Network::resyncNtpTimeFromMenu, true); }},
+    {"6. Measure Dist", enterUltrasonic}, {"7. Resync Time", [](){ performMenuAction(Network::resyncNtpTime, true); }},
     {"8. Show IP Address", [](){ performMenuAction(Network::showIpAddressAndHold, true); }},
     {"9. Get SwitchBot IDs", [](){ performMenuAction(Network::getSwitchBotDeviceList, true); }},
     {"10. Send LINE Test", [](){ performMenuAction(Network::sendLineTestMessage, true); }},
     {"11. Log Data Manually", [](){ performMenuAction(Network::manualLogToSheet, true); }},
-    {"12. Reboot", Utils::rebootDevice},
-    {"13. Sensor Diag", enterDiagnostics},
+    {"12. Reboot", Utils::rebootDevice}, {"13. Sensor Diag", enterDiagnostics},
     {"14. Calibrate Sensor", [](){ performMenuAction(Sensors::calibrateSensor, true); }}
 };
 const int MAIN_MENU_COUNT = sizeof(mainMenu) / sizeof(mainMenu[0]);
 
 const MenuItem applianceMenu[] = {
-    {"1. Light", enterDeviceControl}, {"2. TV", enterDeviceControl},
-    {"3. Air Conditioner", enterDeviceControl}, {"4. Fan", enterDeviceControl},
-    {"5. Speaker", enterDeviceControl}, {"6. Others", enterDeviceControl},
+    {"1. Light", enterDeviceControl}, {"2. TV", enterDeviceControl}, {"3. Air Conditioner", enterDeviceControl},
+    {"4. Fan", enterDeviceControl}, {"5. Speaker", enterDeviceControl}, {"6. Others", enterDeviceControl},
     {"7. Back", [](){ changeMode(State::MENU); }}
 };
 const int APPLIANCE_MENU_COUNT = sizeof(applianceMenu) / sizeof(applianceMenu[0]);
 
 const MenuItem wolMenu[] = {
-    {"1. Desktop PC", [](){ performMenuAction([](){
-        byte mac[6];
-        if (Utils::parseMacAddress(MAC_DESKTOP, mac)) {
-            Network::sendWakeOnLan(mac);
-        } else {
-            State::lcd.clear();
-            Display::printLcdLine(0, "Invalid MAC Addr");
-            Display::printLcdLine(1, "Check config.h");
-            delay(ACTION_RESULT_DISPLAY_MS);
-        }
-    }, true); }},
-    {"2. Server PC", [](){ performMenuAction([](){
-        byte mac[6];
-        if (Utils::parseMacAddress(MAC_SERVER, mac)) {
-            Network::sendWakeOnLan(mac);
-        } else {
-            State::lcd.clear();
-            Display::printLcdLine(0, "Invalid MAC Addr");
-            Display::printLcdLine(1, "Check config.h");
-            delay(ACTION_RESULT_DISPLAY_MS);
-        }
-    }, true); }}
+    {"1. Desktop PC", [](){ performMenuAction([](){ Network::sendWakeOnLan(MAC_DESKTOP); }, true); }},
+    {"2. Server PC", [](){ performMenuAction([](){ Network::sendWakeOnLan(MAC_SERVER); }, true); }}
 };
-const int WOL_MENU_COUNT = sizeof(wolMenu)/sizeof(wolMenu[0]);
+const int WOL_MENU_COUNT = sizeof(wolMenu) / sizeof(wolMenu[0]);
 
+struct SwitchBotCommand { const char* buttonText; const char* command; const char* parameter; const char* commandType = "command"; };
+const SwitchBotCommand lightCommands[] = { {"On", "turnOn", "default"}, {"Off", "turnOff", "default"}, {"Bright+", "brightnessUp", "default"}, {"Bright-", "brightnessDown", "default"}, {"Warm", "setColorTemperature", "2700"}, {"White", "setColorTemperature", "6500"}, {"Back", "", ""} };
+const SwitchBotCommand tvCommands[] = { {"Power", "turnOn", "default"}, {"CH +", "channelAdd", "default"}, {"CH -", "channelSub", "default"}, {"Vol +", "volumeAdd", "default"}, {"Vol -", "volumeSub", "default"}, {"Back", "", ""} };
+const SwitchBotCommand acCommands[] = { {"Run", "turnOn", "default"}, {"Stop", "turnOff", "default"}, {"Temp +", "setTemperature", "26,auto,1,on"}, {"Temp -", "setTemperature", "24,auto,1,on"}, {"Cooling", "setAll", "25,2,1,on"}, {"Heating", "setAll", "22,5,1,on"}, {"Dehumidify", "setAll", "25,3,1,on"}, {"Back", "", ""} };
+const SwitchBotCommand fanCommands[] = { {"On", "press", "運転"}, {"Off", "press", "切/入"}, {"Speed +", "press", "風量+"}, {"Speed -", "press", "風量-"}, {"Swing", "press", "スウィング"}, {"Back", "", ""} };
+const SwitchBotCommand speakerCommands[] = { {"Power", "press", "Power"}, {"Vol +", "volumeAdd", "default"}, {"Vol -", "volumeSub", "default"}, {"Prev", "previousTrack", "default"}, {"Next", "nextTrack", "default"}, {"Back", "", ""} };
+const SwitchBotCommand othersCommands[] = { {"Cmd 1", "turnOn", "default"}, {"Cmd 2", "turnOff", "default"}, {"Back", "", ""} };
 
-const MenuItem lightControlMenu[] = {
-    {"On", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "turnOn", "default"); }, false); }},
-    {"Off", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "turnOff", "default"); }, false); }},
-    {"Bright+", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "brightnessUp", "default"); }, false); }},
-    {"Bright-", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "brightnessDown", "default"); }, false); }},
-    {"Warm", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "setColorTemperature", "2700"); }, false); }},
-    {"White", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "setColorTemperature", "6500"); }, false); }},
-    {"Back", [](){ changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }}
-};
-const MenuItem tvControlMenu[] = {
-    {"Power", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_TV, "turnOn", "default", "command"); }, false); }},
-    {"CH +", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_TV, "channelAdd", "default"); }, false); }},
-    {"CH -", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_TV, "channelSub", "default"); }, false); }},
-    {"Vol +", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_TV, "volumeAdd", "default"); }, false); }},
-    {"Vol -", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_TV, "volumeSub", "default"); }, false); }},
-    {"Back", [](){ changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }}
-};
-const MenuItem acControlMenu[] = {
-    {"Run", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "turnOn", "default"); }, false); }},
-    {"Stop", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "turnOff", "default"); }, false); }},
-    {"Temp +", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "setTemperature", "26,auto,1,on"); }, false); }},
-    {"Temp -", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "setTemperature", "24,auto,1,on"); }, false); }},
-    {"Cooling", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "setAll", "25,2,1,on"); }, false); }},
-    {"Heating", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "setAll", "22,5,1,on"); }, false); }},
-    {"Dehumidify",[](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_AC, "setAll", "25,3,1,on"); }, false); }},
-    {"Back", [](){ changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }}
-};
-const MenuItem fanControlMenu[] = {
-    {"On", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_FAN, "press", "運転"); }, false); }},
-    {"Off", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_FAN, "press", "切/入"); }, false); }},
-    {"Speed +", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_FAN, "press", "風量+"); }, false); }},
-    {"Speed -", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_FAN, "press", "風量-"); }, false); }},
-    {"Swing", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_FAN, "press", "スウィング"); }, false); }},
-    {"Back", [](){ changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }}
-};
-const MenuItem speakerControlMenu[] = {
-    {"Power", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_SPEAKER, "press", "Power"); }, false); }},
-    {"Vol +", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_SPEAKER, "volumeAdd", "default"); }, false); }},
-    {"Vol -", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_SPEAKER, "volumeSub", "default"); }, false); }},
-    {"Prev", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_SPEAKER, "previousTrack", "default"); }, false); }},
-    {"Next", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_SPEAKER, "nextTrack", "default"); }, false); }},
-    {"Back", [](){ changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }}
-};
-const MenuItem othersControlMenu[] = {
-    {"Command 1", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_OTHERS, "turnOn", "default"); }, false); }},
-    {"Command 2", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_OTHERS, "turnOff", "default"); }, false); }},
-    {"Back", [](){ changeMode(State::SWITCHBOT_APPLIANCE_SELECT); }}
-};
+const SwitchBotCommand* const applianceCommands[] = { lightCommands, tvCommands, acCommands, fanCommands, speakerCommands, othersCommands };
+const int applianceCommandCounts[] = { 7, 6, 8, 6, 6, 3 };
+const char* const deviceIDs[] = { DEVICE_ID_LIGHT, DEVICE_ID_TV, DEVICE_ID_AC, DEVICE_ID_FAN, DEVICE_ID_SPEAKER, DEVICE_ID_OTHERS };
 
-const MenuItem* const applianceControlMenus[] = { lightControlMenu, tvControlMenu, acControlMenu, fanControlMenu, speakerControlMenu, othersControlMenu };
-const int applianceControlMenuCounts[] = { 7, 6, 8, 6, 6, 3 };
+void performSwitchBotAction() {
+    int devIdx = State::menu.deviceSelection;
+    int cmdIdx = State::menu.commandSelection;
+    if (strcmp(applianceCommands[devIdx][cmdIdx].buttonText, "Back") == 0) {
+        changeMode(State::SWITCHBOT_APPLIANCE_SELECT);
+    } else {
+        Network::executeSwitchBotCommand(devIdx, cmdIdx);
+        changeMode(State::menu.currentMode); 
+    }
+}
 
 const MenuItem* getCurrentMenu(int& count, int& selection) {
     switch(State::menu.currentMode) {
@@ -397,10 +229,14 @@ const MenuItem* getCurrentMenu(int& count, int& selection) {
             selection = State::menu.menuSelection;
             return wolMenu;
         case State::DEVICE_CONTROL:
-            if(State::menu.deviceSelection < sizeof(applianceControlMenus)/sizeof(MenuItem**)) {
-                count = applianceControlMenuCounts[State::menu.deviceSelection];
+             if(State::menu.deviceSelection < sizeof(applianceCommands)/sizeof(SwitchBotCommand**)) {
+                count = applianceCommandCounts[State::menu.deviceSelection];
                 selection = State::menu.commandSelection;
-                return applianceControlMenus[State::menu.deviceSelection];
+                static MenuItem tempDeviceMenu[20];
+                for(int i = 0; i < count; ++i) {
+                  tempDeviceMenu[i] = { applianceCommands[State::menu.deviceSelection][i].buttonText, nullptr };
+                }
+                return tempDeviceMenu;
             }
         default:
             count = 0;
@@ -409,27 +245,10 @@ const MenuItem* getCurrentMenu(int& count, int& selection) {
     }
 }
 }
-
 //================================================================
 // ユーティリティ関数
 //================================================================
 namespace Utils {
-// MACアドレス文字列 ("XX:XX:XX:XX:XX:XX") をbyte配列に変換する関数
-bool parseMacAddress(const char* macStr, byte* macArray) {
-    // sscanfを使用して6つの16進数値を読み取る
-    // %hhx は unsigned char (Arduinoのbyteと同じ) として読み取るための指定子
-    int values[6];
-    if (sscanf(macStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-               &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) {
-        // 読み取りが成功した場合、int配列からbyte配列に値をコピー
-        for (int i = 0; i < 6; ++i) {
-            macArray[i] = (byte)values[i];
-        }
-        return true; // 成功
-    }
-    return false; // 失敗
-}
-
 void setRGB(int r, int g, int b) {
     analogWrite(Pins::LED_R, r);
     analogWrite(Pins::LED_G, g);
@@ -466,7 +285,7 @@ void handleSmoothIllumination() {
 }
 
 void toggleBacklightMode() {
-    State::lcd.clear();
+    Display::safeClear();
     State::system.backlightAlwaysOn = !State::system.backlightAlwaysOn;
     digitalWrite(Pins::LCD_BACKLIGHT, State::system.backlightAlwaysOn ? HIGH : LOW);
     Display::printLcdLine(0, "Backlight Mode");
@@ -475,7 +294,7 @@ void toggleBacklightMode() {
 }
 
 void toggleIlluminationMode() {
-    State::lcd.clear();
+    Display::safeClear();
     State::system.illuminationOn = !State::system.illuminationOn;
     if (!State::system.illuminationOn) {
         setRGB(0, 0, 0);
@@ -486,25 +305,46 @@ void toggleIlluminationMode() {
 }
 
 void rebootDevice() {
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "Rebooting...");
     delay(1000);
     rp2040.reboot();
 }
 }
-
 //================================================================
-// ディスプレイ管理 (コア0)
+// ディスプレイ管理 (Core 0)
 //================================================================
 namespace Display {
+// 【安定化】LCDへの書き込みを安定させるためのラッパー関数群
+void safeClear() {
+    noInterrupts();
+    State::lcd.clear();
+    interrupts();
+    delay(2); // clear()は時間がかかるため、長めの待機
+}
+
+void safeSetCursor(int col, int row) {
+    noInterrupts();
+    State::lcd.setCursor(col, row);
+    interrupts();
+    delayMicroseconds(50); // カーソル移動は速いが、念のため待機
+}
+
+void safePrint(const char* text) {
+    noInterrupts();
+    State::lcd.print(text);
+    interrupts();
+    delayMicroseconds(100); // 各プリント後に待機
+}
+
 void printLcdLine(int line, const char* text) {
     char buf[LCD_COLS + 1];
     snprintf(buf, sizeof(buf), "%-*s", LCD_COLS, text);
-    State::lcd.setCursor(0, line);
-    State::lcd.print(buf);
+    safeSetCursor(0, line);
+    safePrint(buf);
 }
 
-namespace {
+namespace { 
     unsigned long wolMessageEndTime = 0;
     char wolMessage[LCD_COLS + 1] = "";
 
@@ -534,12 +374,12 @@ namespace {
 
     void drawLightningInfo() {
         char buf[LCD_COLS + 1];
-        if (State::sensors.lastEventType == "Lightning") {
+        if (strcmp(State::sensors.lastEventType, "Lightning") == 0) {
             snprintf(buf, sizeof(buf), "Last Evt:%s", State::sensors.lastEventTime);
             printLcdLine(2, buf);
             snprintf(buf, sizeof(buf), "Distance: %d km", State::sensors.lastLightningDistance);
             printLcdLine(3, buf);
-        } else if (State::sensors.lastEventType == "Noise") {
+        } else if (strcmp(State::sensors.lastEventType, "Noise") == 0) {
             snprintf(buf, sizeof(buf), "Last Evt:%s", State::sensors.lastEventTime);
             printLcdLine(2, buf);
             printLcdLine(3, "Distance: Noise");
@@ -571,7 +411,7 @@ void updateMainDisplay() {
     }
 
     if (State::system.forceMainScreenRedraw) {
-        State::lcd.clear();
+        safeClear();
         drawTime();
         if (wolMessageActive) {
             printLcdLine(1, wolMessage);
@@ -596,13 +436,15 @@ void drawMenu() {
     int itemCount = 0, currentSelection = 0;
     const Menu::MenuItem* menuItems = Menu::getCurrentMenu(itemCount, currentSelection);
     if (!menuItems) return;
-
-    int page = currentSelection / LCD_ROWS;
+    
+    int page = (State::menu.currentMode == State::DEVICE_CONTROL ? State::menu.commandSelection : State::menu.menuSelection) / LCD_ROWS;
+    
     for(int i=0; i < LCD_ROWS; i++) {
         int index = page * LCD_ROWS + i;
         char buf[LCD_COLS + 1];
         if (index < itemCount) {
-            sprintf(buf, "%s%s", (index == currentSelection ? ">" : " "), menuItems[index].text);
+            int currentAbsoluteSelection = (State::menu.currentMode == State::DEVICE_CONTROL) ? State::menu.commandSelection : State::menu.menuSelection;
+            sprintf(buf, "%s%s", (index == currentAbsoluteSelection ? ">" : " "), menuItems[index].text);
         } else {
             strcpy(buf, "");
         }
@@ -616,7 +458,7 @@ void drawHistoryScreen() {
         char buf[LCD_COLS + 1];
         if (i < State::history.count) {
             int idx = (State::history.index - 1 - i + HISTORY_SIZE) % HISTORY_SIZE;
-            if (State::history.records[idx].type == "Noise") {
+            if (strcmp(State::history.records[idx].type, "Noise") == 0) {
                 snprintf(buf, sizeof(buf), "%d: %s Noise", i + 1, State::history.records[idx].timestamp);
             } else {
                 snprintf(buf, sizeof(buf), "%d: %s %2dkm", i + 1, State::history.records[idx].timestamp, State::history.records[idx].distance);
@@ -647,22 +489,18 @@ void drawUltrasonicMonitorScreen() {
 
 void drawDiagnosticsScreen() {
     static unsigned long lastReadTime = 0;
-    if (millis() - lastReadTime > 1000) {
+    if (millis() - lastReadTime > 1000) { 
         lastReadTime = millis();
-
         printLcdLine(0, "--- Sensor Diag ---");
         char buf[LCD_COLS + 1];
-
         uint8_t noise = State::lightning.readNoiseLevel();
         uint8_t watchdog = State::lightning.readWatchdogThreshold();
         snprintf(buf, sizeof(buf), "Noise:%d Watchdog:%d", noise, watchdog);
         printLcdLine(1, buf);
-
         uint8_t spike = State::lightning.readSpikeRejection();
         uint8_t intReg = State::lightning.readInterruptReg();
         snprintf(buf, sizeof(buf), "Spike:%d IntReg:0x%02X", spike, intReg);
         printLcdLine(2, buf);
-
         int irqPinState = digitalRead(Pins::LIGHTNING_IRQ);
         snprintf(buf, sizeof(buf), "IRQ Pin State: %d", irqPinState);
         printLcdLine(3, buf);
@@ -683,11 +521,11 @@ void update() {
         case State::SENSOR_DIAGNOSTICS:
             drawDiagnosticsScreen();
             break;
-        default: // MENU, DEVICE_CONTROLなど
+        default:
             if(State::system.needsRedraw) drawMenu();
             break;
     }
-
+    
     if (State::system.needsRedraw) {
         State::system.needsRedraw = false;
     }
@@ -703,53 +541,23 @@ void init() {
 }
 
 //================================================================
-// ネットワーク管理 (コア1の処理が中心)
+// ネットワーク管理 (Core 1)
 //================================================================
 namespace Network {
-
-void initOTA() {
-    if (State::system.otaInitialized || !State::g_wifiConnected) {
-        return;
+bool parseMacAddress(const char* macStr, byte* macArray) {
+    if (sscanf(macStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", 
+               &macArray[0], &macArray[1], &macArray[2], 
+               &macArray[3], &macArray[4], &macArray[5]) == 6) {
+        return true;
     }
-
-    ArduinoOTA.setHostname("pico-lightning-sensor");
-
-    ArduinoOTA.onStart([]() {
-        String type;
-        if (ArduinoOTA.getCommand() == U_FLASH)
-            type = "sketch";
-        else // U_SPIFFS
-            type = "filesystem";
-        if (DEBUG) Serial.println("Start updating " + type);
-    });
-    ArduinoOTA.onEnd([]() {
-        if (DEBUG) Serial.println("\nEnd");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        if (DEBUG) Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-        if (DEBUG) {
-          Serial.printf("Error[%u]: ", error);
-          if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-          else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-          else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-          else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-          else if (error == OTA_END_ERROR) Serial.println("End Failed");
-        }
-    });
-
-    ArduinoOTA.begin();
-    State::system.otaInitialized = true;
-    if (DEBUG) Serial.println("OTA Ready. Hostname: pico-lightning-sensor");
+    return false;
 }
 
 void urlEncode(const char* msg, char* encodedMsg, size_t bufferSize) {
     const char *hex = "0123456789abcdef";
     size_t index = 0;
     while (*msg != '\0' && index < bufferSize - 1) {
-        if (('a' <= *msg && *msg <= 'z') || ('A' <= *msg && *msg <= 'Z') || ('0' <= *msg && *msg <= '9') ||
-            *msg == '-' || *msg == '_' || *msg == '.' || *msg == '~') {
+        if (isalnum(*msg) || *msg == '-' || *msg == '_' || *msg == '.' || *msg == '~') {
             encodedMsg[index++] = *msg;
         } else {
             if (index + 3 < bufferSize) {
@@ -796,144 +604,178 @@ void addAuthHeaders(HTTPClient& http) {
     http.addHeader("sign", sign);
 }
 
-void sendLineNotification(String message) {
-    if (!State::g_wifiConnected) return;
+// 共通HTTPリクエスト実行関数
+bool performHttpRequest(const char* url, const char* method, const char* body, String& payload, bool isSecure = true, bool addAuth = false) {
+    if (!State::g_wifiConnected) return false;
+    
+    HTTPClient http;
+    WiFiClientSecure* secureClient = nullptr;
+    WiFiClient* client = nullptr;
+    bool success = false;
 
+    if (isSecure) {
+        secureClient = new WiFiClientSecure();
+        secureClient->setInsecure();
+        if (!http.begin(*secureClient, url)) { delete secureClient; return false; }
+    } else {
+        client = new WiFiClient();
+        if (!http.begin(*client, url)) { delete client; return false; }
+    }
+    
+    if (addAuth) addAuthHeaders(http);
+
+    int httpCode;
+    if (strcmp(method, "POST") == 0) {
+        http.addHeader("Content-Type", "application/json; charset=utf-8");
+        httpCode = http.POST(body);
+    } else {
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        httpCode = http.GET();
+    }
+
+    if (httpCode == HTTP_CODE_OK) {
+        payload = http.getString();
+        success = true;
+    }
+    if(DEBUG) Serial.printf("[HTTP] %s to %s... code: %d\n", method, url, httpCode);
+    
+    http.end();
+    if(secureClient) delete secureClient;
+    if(client) delete client;
+
+    return success;
+}
+
+void sendLineNotification(const char* message) {
+    JsonDocument doc;
+    doc["to"] = LINE_USER_ID;
+    JsonObject msgObj = doc["messages"].to<JsonArray>().add<JsonObject>();
+    msgObj["type"] = "text";
+    msgObj["text"] = message;
+    String requestBody;
+    serializeJson(doc, requestBody);
+    
+    if (!State::g_wifiConnected) return;
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
     if (http.begin(client, "https://api.line.me/v2/bot/message/push")) {
         http.addHeader("Content-Type", "application/json");
         http.addHeader("Authorization", "Bearer " + String(LINE_CHANNEL_ACCESS_TOKEN));
-        JsonDocument doc;
-        doc["to"] = LINE_USER_ID;
-        JsonObject msgObj = doc["messages"].to<JsonArray>().add<JsonObject>();
-        msgObj["type"] = "text";
-        msgObj["text"] = message;
-        String requestBody;
-        serializeJson(doc, requestBody);
         http.POST(requestBody);
         http.end();
     }
 }
 
-void sendSwitchBotCommand(const char* deviceId, const char* command, const char* parameter, const char* commandType) {
-    State::lcd.clear();
-    if (!State::g_wifiConnected) {
-        Display::printLcdLine(0, "WiFi Disconnected");
-        delay(ACTION_RESULT_DISPLAY_MS);
-        return;
-    }
+void executeSwitchBotCommand(int deviceIndex, int commandIndex) {
+    Display::safeClear();
+    if (!State::g_wifiConnected) { Display::printLcdLine(0, "WiFi Disconnected"); delay(ACTION_RESULT_DISPLAY_MS); return; }
     Display::printLcdLine(0, "Sending Command...");
-    Display::printLcdLine(1, "Please wait...");
+    
+    const char* deviceId = Menu::deviceIDs[deviceIndex];
+    const auto& cmd = Menu::applianceCommands[deviceIndex][commandIndex];
+    
+    JsonDocument doc;
+    doc["command"] = cmd.command;
+    doc["parameter"] = cmd.parameter;
+    doc["commandType"] = cmd.commandType;
+    String jsonBody;
+    serializeJson(doc, jsonBody);
 
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    HTTPClient http;
-    bool success = false;
-    if (http.begin(secureClient, "https://api.switch-bot.com/v1.1/devices/" + String(deviceId) + "/commands")) {
-        addAuthHeaders(http);
-        http.addHeader("Content-Type", "application/json; charset=utf-8");
-        JsonDocument doc;
-        doc["command"] = command;
-        doc["parameter"] = parameter;
-        doc["commandType"] = commandType;
-        String jsonBody;
-        serializeJson(doc, jsonBody);
-        if (http.POST(jsonBody) == HTTP_CODE_OK) {
-            success = true;
-        }
-        http.end();
-    }
-
-    State::lcd.clear();
+    char url[128];
+    snprintf(url, sizeof(url), "https://api.switch-bot.com/v1.1/devices/%s/commands", deviceId);
+    
+    String response;
+    bool success = performHttpRequest(url, "POST", jsonBody.c_str(), response, true, true);
+    
+    Display::safeClear();
     Display::printLcdLine(0, "Command Result");
     Display::printLcdLine(1, success ? "Success!" : "Failed!");
     delay(ACTION_RESULT_DISPLAY_MS);
 }
 
-bool sendWakeOnLanPacket(const byte mac[6]) {
-    WiFiUDP udp;
-    if (udp.begin(9)) {
-        byte magicPacket[102];
-        memset(magicPacket, 0xFF, 6);
-        for (int i = 1; i <= 16; i++) {
-            memcpy(&magicPacket[i * 6], mac, 6);
-        }
-        udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
-        udp.write(magicPacket, sizeof(magicPacket));
 
-        if (udp.endPacket()) {
-            if (DEBUG) Serial.println("WoL packet sent.");
-            return true;
-        } else {
-            if (DEBUG) Serial.println("WoL packet send failed.");
-            return false;
-        }
-    } else {
-        if (DEBUG) Serial.println("WoL UDP setup failed.");
-        return false;
+void getSwitchBotDeviceList(){
+    Display::safeClear();
+    Display::printLcdLine(0, "Getting Device IDs");
+    if (!State::g_wifiConnected) { Display::printLcdLine(1, "WiFi Disconnected"); delay(ACTION_RESULT_DISPLAY_MS); return; }
+    Display::printLcdLine(1, "Check Serial Mon.");
+
+    String response;
+    bool success = performHttpRequest("https://api.switch-bot.com/v1.1/devices", "GET", nullptr, response, true, true);
+
+    if (success && DEBUG) {
+        Serial.println("\n--- SwitchBot Device List ---");
+        Serial.println(response);
     }
-}
-
-void sendWakeOnLan(const byte mac[6]) {
-    State::lcd.clear();
-    Display::printLcdLine(0, "Sending WoL Packet...");
-
-    bool success = sendWakeOnLanPacket(mac);
-
-    Display::printLcdLine(1, success ? "Packet Sent!" : "Send Failed!");
+    Display::printLcdLine(2, success ? "Success!" : "Failed!");
     delay(ACTION_RESULT_DISPLAY_MS);
 }
 
+void logDataToGoogleSheet(const char* params) {
+    if (String(GAS_URL).startsWith("-----")) return;
+    char url[256];
+    snprintf(url, sizeof(url), "%s%s", GAS_URL, params);
+    String response;
+    performHttpRequest(url, "GET", nullptr, response, true, false);
+}
 
-void requestDistance() {
-    if (!State::g_wifiConnected || State::childIpAddress == "") {
-        State::sensors.ultrasonicDistance = -2.0;
-        return;
+void sendWakeOnLan(const char* macStr) {
+    Display::safeClear();
+    Display::printLcdLine(0, "Sending WoL Packet...");
+    
+    byte macArray[6];
+    bool success = false;
+
+    if (parseMacAddress(macStr, macArray)) {
+        WiFiUDP udp;
+        if (udp.begin(9)) {
+            byte magicPacket[102];
+            memset(magicPacket, 0xFF, 6);
+            for (int i = 1; i <= 16; i++) memcpy(&magicPacket[i * 6], macArray, 6);
+            udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
+            udp.write(magicPacket, sizeof(magicPacket));
+            if (udp.endPacket()) success = true;
+        }
     }
 
-    HTTPClient http;
-    WiFiClient client;
-    if (http.begin(client, "http://" + State::childIpAddress + "/distance")) {
-        http.setTimeout(400);
-        if (http.GET() == HTTP_CODE_OK) {
-            JsonDocument doc;
-            if (deserializeJson(doc, http.getString()) == DeserializationError::Ok) {
-                State::sensors.ultrasonicDistance = doc["distance"];
-            }
-        } else {
-            State::sensors.ultrasonicDistance = -3.0;
-        }
-        http.end();
+    if(success) {
+        Display::printLcdLine(1, "Packet Sent!");
     } else {
-        State::sensors.ultrasonicDistance = -4.0;
+        Display::printLcdLine(1, "Send Failed!");
+        if (DEBUG) Serial.println("WoL failed. Check MAC format or network.");
+    }
+    delay(ACTION_RESULT_DISPLAY_MS);
+}
+
+void requestDistance() {
+    if (State::childIpAddress == "") { State::sensors.ultrasonicDistance = -2.0; return; }
+    char url[64];
+    snprintf(url, sizeof(url), "http://%s/distance", State::childIpAddress.c_str());
+    String response;
+    if (performHttpRequest(url, "GET", nullptr, response, false, false)) {
+        JsonDocument doc;
+        if (deserializeJson(doc, response) == DeserializationError::Ok) {
+            State::sensors.ultrasonicDistance = doc["distance"];
+        }
+    } else {
+        State::sensors.ultrasonicDistance = -3.0;
     }
 }
 
 void handleNtpSync() {
     if (!State::g_wifiConnected || State::system.ntpInitialized) return;
-
-    if (!State::system.isAutoResync) {
-        if (DEBUG) Serial.println("[Core 1] NTP sync started...");
-    }
+    if (!State::system.isAutoResync && DEBUG) Serial.println("[Core 1] NTP sync started...");
     State::system.isAutoResync = false;
-
     setenv("TZ", "JST-9", 1);
     tzset();
-
     NTP.begin(NTP_SERVER);
-
     bool syncSuccess = false;
     unsigned long ntp_timeout = millis();
     while (millis() - ntp_timeout < 15000) {
-        if (time(nullptr) > 100000) {
-            syncSuccess = true;
-            break;
-        }
+        if (time(nullptr) > 100000) { syncSuccess = true; break; }
         delay(500);
     }
-
     if (syncSuccess) {
         if (DEBUG) Serial.println("\n[Core 1] NTP Sync Successful!");
         State::system.ntpInitialized = true;
@@ -944,126 +786,40 @@ void handleNtpSync() {
     State::system.forceMainScreenRedraw = true;
 }
 
-
-void logDataToGoogleSheet(const char* params) {
-    if (!State::g_wifiConnected || String(GAS_URL).startsWith("-----")) {
-        if (DEBUG) Serial.println("Cannot log to sheet: WiFi not connected or GAS_URL not set.");
-        return;
-    }
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s", GAS_URL, params);
-
-    if (http.begin(client, url)) {
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        int httpCode = http.GET();
-        if (httpCode > 0) {
-            if (DEBUG) Serial.printf("[HTTP] GET... code: %d\n", httpCode);
-        } else {
-            if (DEBUG) Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
-        }
-        http.end();
-    } else {
-        if (DEBUG) Serial.printf("[HTTP] Unable to connect to %s\n", url);
-    }
-}
-
-
-void resyncNtpTimeFromMenu() {
-    State::lcd.clear();
+void resyncNtpTime() {
+    Display::safeClear();
     Display::printLcdLine(0, "Resyncing Time...");
-    if (!State::g_wifiConnected) {
-        Display::printLcdLine(1, "WiFi Disconnected");
-        delay(ACTION_RESULT_DISPLAY_MS);
-        return;
-    }
-
-    resyncNtpTime();
-
+    if (!State::g_wifiConnected) { Display::printLcdLine(1, "WiFi Disconnected"); delay(ACTION_RESULT_DISPLAY_MS); return; }
+    State::system.ntpInitialized = false;
+    State::system.isAutoResync = true;
+    handleNtpSync();
     Display::printLcdLine(1, State::system.ntpInitialized ? "Success!" : "Failed!");
     delay(ACTION_RESULT_DISPLAY_MS);
 }
 
-void resyncNtpTime() {
-    if (!State::g_wifiConnected) {
-        if (DEBUG) Serial.println("NTP Resync failed. WiFi not connected.");
-        return;
-    }
-    State::system.ntpInitialized = false;
-    State::system.isAutoResync = true;
-    if (DEBUG) Serial.println("NTP Resync requested.");
-    handleNtpSync();
-}
-
 void sendLineTestMessage() {
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "Sending LINE Test...");
-    if (!State::g_wifiConnected) {
-        Display::printLcdLine(1, "WiFi Disconnected");
-        delay(ACTION_RESULT_DISPLAY_MS);
-        return;
-    }
+    if (!State::g_wifiConnected) { Display::printLcdLine(1, "WiFi Disconnected"); delay(ACTION_RESULT_DISPLAY_MS); return; }
     sendLineNotification("これは雷センサーからのテスト通知です。");
     Display::printLcdLine(1, "Sent!");
     delay(ACTION_RESULT_DISPLAY_MS);
 }
 
-void getSwitchBotDeviceList(){
-    State::lcd.clear();
-    Display::printLcdLine(0, "Getting Device IDs");
-    if (!State::g_wifiConnected) {
-        Display::printLcdLine(1, "WiFi Disconnected");
-        delay(ACTION_RESULT_DISPLAY_MS);
-        return;
-    }
-    Display::printLcdLine(1, "Check Serial Mon.");
-
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    HTTPClient http;
-    bool success = false;
-    if (http.begin(secureClient, "https://api.switch-bot.com/v1.1/devices")) {
-        addAuthHeaders(http);
-        if (http.GET() == HTTP_CODE_OK) {
-            success = true;
-            if (DEBUG) {
-                Serial.println("\n--- SwitchBot Device List ---");
-                Serial.println(http.getString());
-            }
-        }
-        http.end();
-    }
-    Display::printLcdLine(2, success ? "Success!" : "Failed!");
-    delay(ACTION_RESULT_DISPLAY_MS);
-}
-
 void showIpAddressAndHold() {
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "IP Address:");
-    if (State::g_wifiConnected) {
-        Display::printLcdLine(1, WiFi.localIP().toString().c_str());
-    } else {
-        Display::printLcdLine(1, "Disconnected");
-    }
+    Display::printLcdLine(1, State::g_wifiConnected ? WiFi.localIP().toString().c_str() : "Disconnected");
     delay(IP_DISPLAY_DURATION_MS);
 }
 
 void manualLogToSheet() {
-    State::lcd.clear();
-    if (!State::g_wifiConnected) {
-        Display::printLcdLine(0, "WiFi Disconnected");
-        delay(ACTION_RESULT_DISPLAY_MS);
-        return;
-    }
+    Display::safeClear();
+    if (!State::g_wifiConnected) { Display::printLcdLine(0, "WiFi Disconnected"); delay(ACTION_RESULT_DISPLAY_MS); return; }
     Display::printLcdLine(0, "Logging to Sheet...");
-    Display::printLcdLine(1, "Please wait...");
-
     char params[128];
     createTempHumParams(params, sizeof(params));
-
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "Logging Result");
     if (strlen(params) > 0) {
         logDataToGoogleSheet(params);
@@ -1076,92 +832,74 @@ void manualLogToSheet() {
 
 void pollGasForWol() {
     if (String(GAS_URL_WOL).startsWith("-----")) return;
-
-    WiFiClientSecure client;
-    HTTPClient http;
-    client.setInsecure();
-
-    if (DEBUG) Serial.print("[Core 1] Polling GAS for WoL signal...");
-
-    char signalCheckUrl[128];
-    snprintf(signalCheckUrl, sizeof(signalCheckUrl), "%s?action=signal", GAS_URL_WOL);
-
-    if (http.begin(client, signalCheckUrl)) {
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        http.setTimeout(3800);
-
-        int httpCode = http.GET();
-
-        if (httpCode == HTTP_CODE_OK) {
-            String payload = http.getString();
-            payload.trim();
-
-            if (payload == "TRIGGER") {
-                if (DEBUG) Serial.println("  -> Trigger detected! Getting command...");
-                http.end();
-
-                delay(500);
-
-                char commandGetUrl[128];
-                snprintf(commandGetUrl, sizeof(commandGetUrl), "%s?action=command", GAS_URL_WOL);
-
-                if (http.begin(client, commandGetUrl)){
-                    httpCode = http.GET();
-                    if (httpCode == HTTP_CODE_OK) {
-                        payload = http.getString();
-                        payload.trim();
-                        if (DEBUG) Serial.printf("  -> Command received: [%s]\n", payload.c_str());
-
-                        if (payload == "デスクトップPC起動") {
-                            byte mac[6];
-                            if (Utils::parseMacAddress(MAC_DESKTOP, mac)) {
-                                if (sendWakeOnLanPacket(mac)) {
-                                    State::g_wolTarget = 1;
-                                    State::g_wolTriggered = true;
-                                }
-                            } else {
-                                if (DEBUG) Serial.println("[Core 1] Invalid Desktop MAC format in config.h");
-                            }
-                        } else if (payload == "サーバーPC起動") {
-                            byte mac[6];
-                             if (Utils::parseMacAddress(MAC_SERVER, mac)) {
-                                if (sendWakeOnLanPacket(mac)) {
-                                    State::g_wolTarget = 2;
-                                    State::g_wolTriggered = true;
-                                }
-                            } else {
-                                if (DEBUG) Serial.println("[Core 1] Invalid Server MAC format in config.h");
-                            }
-                        }
-                    } else {
-                        if (DEBUG) Serial.printf("  -> HTTP Command GET failed, error: %d\n", httpCode);
-                    }
-                }
-            } else if (DEBUG) {
-                 Serial.println(" -> No trigger.");
+    char url[128];
+    snprintf(url, sizeof(url), "%s?action=signal", GAS_URL_WOL);
+    String response;
+    if (performHttpRequest(url, "GET", nullptr, response, true, false)) {
+        response.trim();
+        if (response == "TRIGGER") {
+            delay(500);
+            snprintf(url, sizeof(url), "%s?action=command", GAS_URL_WOL);
+            if (performHttpRequest(url, "GET", nullptr, response, true, false)) {
+                response.trim();
+                const char* macStr = nullptr;
+                if (response == "デスクトップPC起動") { macStr = MAC_DESKTOP; State::g_wolTarget = 1; }
+                else if (response == "サーバーPC起動") { macStr = MAC_SERVER; State::g_wolTarget = 2; }
+                if (macStr) { State::g_wolTriggered = true; sendWakeOnLan(macStr); }
             }
-        } else {
-            if (DEBUG) Serial.printf(" -> HTTP Signal GET failed, error: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
         }
-    } else {
-        if (DEBUG) Serial.println(" -> http.begin failed.");
     }
-    http.end();
+}
+
+void initOTA() {
+    if (State::system.otaInitialized || !State::g_wifiConnected) {
+        return;
+    }
+
+    ArduinoOTA.setHostname("pico-lightning-sensor");
+
+    ArduinoOTA.onStart([]() {
+        String type;
+        if (ArduinoOTA.getCommand() == U_FLASH)
+            type = "sketch";
+        else
+            type = "filesystem";
+        if (DEBUG) Serial.println("Start updating " + type);
+    });
+    ArduinoOTA.onEnd([]() {
+        if (DEBUG) Serial.println("\nEnd");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        if (DEBUG) Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+        if (DEBUG) {
+          Serial.printf("Error[%u]: ", error);
+          if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+          else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+          else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+          else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+          else if (error == OTA_END_ERROR) Serial.println("End Failed");
+        }
+    });
+
+    ArduinoOTA.begin();
+    State::system.otaInitialized = true;
+    if (DEBUG) Serial.println("OTA Ready. Hostname: pico-lightning-sensor");
 }
 
 }
-
 //================================================================
-// センサー管理 (コア0)
+// センサー管理 (Core 0)
 //================================================================
 namespace Sensors {
 void handleLightningInterrupt() {
     State::lightningInterruptFlag = true;
 }
 
-void addHistoryRecord(String type, int distance, const char* timestamp) {
+void addHistoryRecord(const char* type, int distance, const char* timestamp) {
     strcpy(State::history.records[State::history.index].timestamp, timestamp);
-    State::history.records[State::history.index].type = type;
+    strcpy(State::history.records[State::history.index].type, type);
     State::history.records[State::history.index].distance = distance;
     State::history.index = (State::history.index + 1) % HISTORY_SIZE;
     if(State::history.count < HISTORY_SIZE) {
@@ -1174,7 +912,7 @@ void handleLightning() {
     delay(5);
     int intVal = State::lightning.readInterruptReg();
     if (DEBUG) Serial.printf("Interrupt Register: 0x%02X\n", intVal);
-
+    
     char timestamp[20];
     if (intVal == 0x01 || intVal == 0x08) {
         time_t now = time(nullptr);
@@ -1188,7 +926,7 @@ void handleLightning() {
     }
 
     if (intVal == 0x01) {
-        State::sensors.lastEventType = "Noise";
+        strcpy(State::sensors.lastEventType, "Noise");
         if (AUTO_NOISE_LEVEL_CONTROL && State::system.currentNoiseLevel < 7) {
             State::system.currentNoiseLevel++;
             State::lightning.setNoiseLevel(State::system.currentNoiseLevel);
@@ -1200,10 +938,8 @@ void handleLightning() {
         Utils::blinkLED("yellow", 2, 80);
         int distance = State::lightning.distanceToStorm();
         State::sensors.lastLightningDistance = distance;
-        State::sensors.lastEventType = "Lightning";
-
+        strcpy(State::sensors.lastEventType, "Lightning");
         addHistoryRecord("Lightning", distance, timestamp);
-
         State::g_pending_lightning_log_core1 = true;
     }
     State::system.forceMainScreenRedraw = true;
@@ -1212,13 +948,9 @@ void handleLightning() {
 void updateDht() {
     float temp_raw = State::dht20.getTemperature();
     float hum_raw = State::dht20.getHumidity();
-
     if (!isnan(temp_raw) && !isnan(hum_raw)) {
         State::sensors.temperature = round(temp_raw * 10.0) / 10.0;
-
-        if (hum_raw >= 0 && hum_raw <= 1.0) {
-            hum_raw *= 100.0;
-        }
+        if (hum_raw >= 0 && hum_raw <= 1.0) hum_raw *= 100.0;
         State::sensors.humidity = round(hum_raw * 10.0) / 10.0;
     } else {
         if (DEBUG) Serial.println("Failed to read from DHT sensor!");
@@ -1226,15 +958,13 @@ void updateDht() {
 }
 
 void update() {
-    // 雷センサーの割り込みを最優先で処理する
-    // loop()の先頭で呼び出されることで、他の処理より先に実行される
     if (State::lightningInterruptFlag) {
         handleLightning();
     }
 }
 
 void calibrateSensor() {
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "Calibrating...");
     if (State::lightning.calibrateOsc()) {
         Display::printLcdLine(1, "Calibration OK!");
@@ -1250,28 +980,24 @@ void init() {
     if (State::dht20.begin() != 0) {
         if (DEBUG) Serial.println("DHT20 Error! Halting.");
         Display::printLcdLine(1, "DHT20 COM FAILED!");
-        Display::printLcdLine(2, "Check wiring & I2C");
         while(1) { delay(10); }
     }
     Display::printLcdLine(1, "DHT20 Sensor OK");
     delay(1000);
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "System Starting...");
-
+    
     State::system.currentNoiseLevel = INITIAL_NOISE_LEVEL;
     if (!State::lightning.begin(Wire)) {
         if (DEBUG) Serial.println("AS3935 Error! Halting.");
         Display::printLcdLine(1, "AS3935 COM FAILED!");
-        Display::printLcdLine(2, "Check wiring & I2C");
         while(1) { delay(10); }
     } else {
         State::lightning.resetSettings();
-
         State::lightning.setIndoorOutdoor(OUTDOOR);
         State::lightning.setNoiseLevel(State::system.currentNoiseLevel);
         State::lightning.watchdogThreshold(LIGHTNING_WATCHDOG_THRESHOLD);
         State::lightning.spikeRejection(LIGHTNING_SPIKE_REJECTION);
-
         if (DEBUG) {
          Serial.println("--- AS3935 Initial Settings ---");
          Serial.printf("Watchdog Threshold: Set to %d, Read back %d\n", LIGHTNING_WATCHDOG_THRESHOLD, State::lightning.readWatchdogThreshold());
@@ -1280,22 +1006,14 @@ void init() {
          Serial.println("---------------------------------");
         }
         Display::printLcdLine(1, "Lightning Sensor OK");
-        delay(1000);
-        
-        // 起動直後の誤検知を防ぐため、センサー安定用の待機時間を追加
-        State::lcd.clear();
-        Display::printLcdLine(0, "Stabilizing Sensor");
-        Display::printLcdLine(1, "Please wait...");
-        if (DEBUG) Serial.println("[Core 0] Waiting for AS3935 to stabilize before attaching interrupt...");
-        delay(2000); // 2秒間待機してセンサーを安定させる
+        delay(1500);
     }
     attachInterrupt(digitalPinToInterrupt(Pins::LIGHTNING_IRQ), handleLightningInterrupt, RISING);
-    if (DEBUG) Serial.println("[Core 0] Lightning interrupt attached.");
 }
 }
 
 //================================================================
-// 入力処理 (コア0)
+// 入力処理 (Core 0)
 //================================================================
 namespace Input {
 uint8_t buttonState = HIGH;
@@ -1307,20 +1025,16 @@ bool longPressTriggered = false;
 
 void handleButton() {
     int reading = digitalRead(Pins::BUTTON);
-
-    if (reading != lastButtonState) {
-        lastDebounceTime = millis();
-    }
+    if (reading != lastButtonState) { lastDebounceTime = millis(); }
 
     if ((millis() - lastDebounceTime) > debounceDelay) {
         if (reading != buttonState) {
             buttonState = reading;
-
-            if (buttonState == LOW) {
+            if (buttonState == LOW) { // Press
                 buttonPressTime = millis();
                 longPressTriggered = false;
-            } else {
-                if (!longPressTriggered) {
+            } else { // Release
+                if (!longPressTriggered) { // Short Press Action
                     State::timers.lastActivity = millis();
                     State::system.needsRedraw = true;
                     if (State::menu.currentMode == State::MAIN_DISPLAY) {
@@ -1329,10 +1043,10 @@ void handleButton() {
                             State::timers.backlightOn = millis();
                         }
                     } else if (State::menu.currentMode == State::HISTORY || State::menu.currentMode == State::SENSOR_DIAGNOSTICS) {
-                        // これらの画面では短押しは無効
-                    } else {
+                        // Short press does nothing
+                    } else { // Menu navigation
                         int count = 0, currentSelection = 0;
-                        Menu::getCurrentMenu(count, currentSelection);
+                        const Menu::MenuItem* menu = Menu::getCurrentMenu(count, currentSelection);
                         if(count > 0) {
                             if (State::menu.currentMode == State::DEVICE_CONTROL) {
                                 State::menu.commandSelection = (State::menu.commandSelection + 1) % count;
@@ -1351,19 +1065,16 @@ void handleButton() {
         State::timers.lastActivity = millis();
         State::system.needsRedraw = true;
         switch (State::menu.currentMode) {
-            case State::MAIN_DISPLAY:
-                Menu::changeMode(State::MENU);
-                break;
+            case State::MAIN_DISPLAY: Menu::changeMode(State::MENU); break;
             case State::HISTORY:
             case State::ULTRASONIC_MONITOR:
-            case State::SENSOR_DIAGNOSTICS:
-                Menu::changeMode(State::MAIN_DISPLAY);
-                break;
+            case State::SENSOR_DIAGNOSTICS: Menu::changeMode(State::MAIN_DISPLAY); break;
+            case State::DEVICE_CONTROL: Menu::performSwitchBotAction(); break;
             default: {
-                int count = 0, currentSelection = 0;
-                const Menu::MenuItem* menu = Menu::getCurrentMenu(count, currentSelection);
-                if (menu && currentSelection < count) {
-                    menu[currentSelection].action();
+                int count = 0;
+                const Menu::MenuItem* menu = Menu::getCurrentMenu(count, State::menu.menuSelection);
+                if (menu && State::menu.menuSelection < count && menu[State::menu.menuSelection].action) {
+                    menu[State::menu.menuSelection].action();
                 }
                 break;
             }
@@ -1372,13 +1083,12 @@ void handleButton() {
     lastButtonState = reading;
 }
 }
-
 //================================================================
-// メイン制御 (コア0)
+// メイン制御 (Core 0)
 //================================================================
 namespace Menu {
 void changeMode(State::Mode newMode) {
-    State::lcd.clear(); // モード変更時に必ず画面をクリア
+    Display::safeClear();
     State::menu.currentMode = newMode;
     State::menu.menuSelection = 0;
     State::menu.commandSelection = 0;
@@ -1390,14 +1100,10 @@ void changeMode(State::Mode newMode) {
 }
 
 void performMenuAction(void (*action)(), bool returnToMain) {
-    if (action) {
-        action(); // アクション関数内でクリア、表示、待機を完結させる
-    }
-    // アクション後に必ず画面遷移または再描画を行う
+    if (action) { action(); }
     if (returnToMain) {
         changeMode(State::MAIN_DISPLAY);
     } else {
-        // 現在のモードを再読み込みしてメニュー画面を再描画する
         changeMode(State::menu.currentMode);
     }
 }
@@ -1411,9 +1117,8 @@ void checkInactivity() {
     }
 }
 }
-
 //================================================================
-// Setup & Loop (コア0)
+// Setup & Loop (Core 0)
 //================================================================
 void setup() {
     Serial.begin(115200);
@@ -1431,67 +1136,56 @@ void setup() {
     Wire.setSCL(Pins::I2C_SCL);
     Wire.begin();
 
-    // 起動中はバックライトとLEDを点灯
     digitalWrite(Pins::LCD_BACKLIGHT, HIGH);
     Utils::setRGB(255, 255, 255);
-
-    Display::init(); // "System Starting..."
-
-    // Wi-Fi接続処理の前に、センサー類を初期化
+    
+    Display::init();
     Sensors::init();
-
-    // Core1を起動して、Wi-Fi接続をバックグラウンドで開始させる
+    
     if(DEBUG) Serial.println("[Core 0] Starting Core 1 for network tasks.");
     rp2040.restartCore1();
 
-    // Core1がWi-Fiに接続するのを待つ（タイムアウト付き）
-    State::lcd.clear();
+    Display::safeClear();
     Display::printLcdLine(0, "Connecting to WiFi");
     Display::printLcdLine(1, "Please wait...");
     unsigned long wifi_wait_start = millis();
-    while(!State::g_wifiConnected && millis() - wifi_wait_start < 30000) { // 30秒のタイムアウト
-        delay(100);
-    }
+    while(!State::g_wifiConnected && millis() - wifi_wait_start < 30000) { delay(100); }
 
-    // Wi-Fi接続結果をLCDに表示
-    State::lcd.clear();
+    Display::safeClear();
     if (!State::g_wifiConnected) {
         Display::printLcdLine(0, "WiFi Connect FAILED");
         Display::printLcdLine(1, "Check SSID/PASS");
         if (DEBUG) Serial.println("[Core 0] WiFi connection timed out on Core 1.");
-        delay(3000); // ユーザーがメッセージを読めるように待機
+        delay(3000);
     } else {
         Display::printLcdLine(0, "WiFi Connected!");
         Display::printLcdLine(1, WiFi.localIP().toString().c_str());
         if (DEBUG) Serial.println("[Core 0] WiFi connection confirmed from Core 1.");
-        delay(2000);
+        delay(2000); 
     }
-
+    
     Menu::changeMode(State::MAIN_DISPLAY);
-
-    // メイン画面に切り替わったらLEDを消灯し、バックライトモードを適用
+    
     Utils::setRGB(0, 0, 0);
     if (!State::system.backlightAlwaysOn) {
         digitalWrite(Pins::LCD_BACKLIGHT, LOW);
     }
-
+    
     if (DEBUG) Serial.println("--- [Core 0] Boot Complete, Main Screen Active ---");
 }
 
 void loop() {
-    // 雷センサーの割り込みフラグチェックをループの最優先事項にする
-    Sensors::update();
-
     if (State::g_wolTriggered) {
         State::g_wolTriggered = false;
         Display::triggerWolMessage(State::g_wolTarget);
         State::g_wolTarget = 0;
     }
-
+    
     Input::handleButton();
     Display::update();
     Menu::checkInactivity();
-
+    Sensors::update();
+    
     if (State::g_trigger_dht_read) {
         State::g_trigger_dht_read = false;
         if (DEBUG) Serial.println("[Core 0] Reading DHT sensor (triggered by Core 1)...");
@@ -1500,23 +1194,19 @@ void loop() {
 
     static int last_display_second = -1;
     static unsigned long sensor_display_trigger_time = 0;
-
     if (State::system.ntpInitialized) {
         time_t now = time(nullptr);
         struct tm* timeinfo = localtime(&now);
         int current_second = timeinfo->tm_sec;
-
         if (current_second != last_display_second) {
             last_display_second = current_second;
             sensor_display_trigger_time = millis() + 500;
         }
     }
-
     if (sensor_display_trigger_time > 0 && millis() >= sensor_display_trigger_time) {
         sensor_display_trigger_time = 0;
         State::g_update_sensor_display = true;
     }
-
 
     if (State::system.illuminationOn) {
         Utils::handleSmoothIllumination();
@@ -1529,13 +1219,12 @@ void loop() {
     }
 }
 
-
 //================================================================
-// Setup & Loop (コア1)
+// Setup & Loop (Core 1)
 //================================================================
 void setup1() {
     if (DEBUG) Serial.println("[Core 1] Core 1 started. Initializing network...");
-
+    
     WiFi.mode(WIFI_STA);
     if (USE_STATIC_IP) {
         if (DEBUG) Serial.println("[Core 1] Configuring static IP address...");
@@ -1544,45 +1233,33 @@ void setup1() {
         IPAddress subnet(SUBNET_BYTES);
         IPAddress primaryDNS(PRIMARY_DNS_BYTES);
         IPAddress secondaryDNS(SECONDARY_DNS_BYTES);
-
         WiFi.config(local_IP, primaryDNS, gateway, subnet);
         WiFi.setDNS(primaryDNS, secondaryDNS);
     }
 
     int credIndex = 0;
     unsigned long total_start_time = millis();
-
-    // 複数のWiFi設定を順番に試す
-    while(WiFi.status() != WL_CONNECTED && (millis() - total_start_time < 60000)) { // 全体で60秒試す
+    while(WiFi.status() != WL_CONNECTED && (millis() - total_start_time < 60000)) {
         const char* current_ssid = wifiCredentials[credIndex].ssid;
-
         if (strlen(current_ssid) > 0 && strcmp(current_ssid, "-----") != 0) {
             if (DEBUG) Serial.printf("[Core 1] Attempting to connect to SSID: %s\n", current_ssid);
             WiFi.begin(current_ssid, wifiCredentials[credIndex].password);
-
             unsigned long startTime = millis();
-            // 1つのSSIDあたり15秒試す
             while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
-                delay(500);
-                if (DEBUG) Serial.print(".");
+                delay(500); if (DEBUG) Serial.print(".");
             }
             if (DEBUG) Serial.println();
         }
-
-        // 接続できなかった場合、次のSSIDへ
         if (WiFi.status() != WL_CONNECTED) {
             if (DEBUG) Serial.printf("[Core 1] Failed to connect to %s. Trying next...\n", current_ssid);
             credIndex = (credIndex + 1) % numWifiCredentials;
-            if (credIndex == 0) { // 全て試したら少し待つ
-                 delay(1000);
-            }
+            if (credIndex == 0) delay(1000);
         }
     }
 
     if (WiFi.status() == WL_CONNECTED) {
       if (DEBUG) Serial.printf("\n[Core 1] WiFi connected! IP address: %s\n", WiFi.localIP().toString().c_str());
       State::g_wifiConnected = true;
-
       Network::initOTA();
       Network::handleNtpSync();
     } else {
@@ -1597,107 +1274,39 @@ void loop1() {
 
         WiFiClient client = State::server.accept();
         if(client) {
-            if (DEBUG) Serial.println("[Core 1] Client connected.");
-            
-            // ★★★ 修正点: 初回接続時のみLEDを点滅させる ★★★
-            // childIpAddressが空の時が初回接続と判断
-            if (State::childIpAddress == "") {
-                // LEDを青色で3回点滅させる
-                Utils::blinkLED("blue", 3, 150);
-            }
-            
-            // 子機からのIPアドレスを保存（超音波センサー用）
+             if (State::childIpAddress == "") Utils::blinkLED("blue", 3, 150);
             State::childIpAddress = client.remoteIP().toString();
-
-            // HTTPリクエストの最初の行を読み取る
-            String req = client.readStringUntil('\r');
-            client.flush();
-
-            // リクエストが "/data" へのGETリクエストか確認
-            if (req.indexOf("GET /data") != -1) {
-                if (DEBUG) Serial.println("[Core 1] /data endpoint requested. Sending JSON response.");
-                // JSONドキュメントを作成
-                JsonDocument doc;
-                doc["temperature"] = State::sensors.temperature;
-                doc["humidity"] = State::sensors.humidity;
-                doc["last_event_type"] = State::sensors.lastEventType;
-                doc["last_lightning_dist"] = State::sensors.lastLightningDistance;
-
-                // C-style string (char array) を安全にコピー
-                char eventTimeBuffer[20];
-                strncpy(eventTimeBuffer, State::sensors.lastEventTime, sizeof(eventTimeBuffer));
-                eventTimeBuffer[sizeof(eventTimeBuffer) - 1] = '\0'; // 念のため終端文字を追加
-                doc["last_event_time"] = eventTimeBuffer;
-
-                // 雷履歴をJSON配列として追加
-                JsonArray historyArray = doc["history"].to<JsonArray>();
-                for (int i = 0; i < State::history.count; i++) {
-                    int idx = (State::history.index - 1 - i + HISTORY_SIZE) % HISTORY_SIZE;
-                    JsonObject historyObj = historyArray.add<JsonObject>();
-                    historyObj["timestamp"] = State::history.records[idx].timestamp;
-                    historyObj["type"] = State::history.records[idx].type;
-                    historyObj["distance"] = State::history.records[idx].distance;
-                }
-
-                String jsonResponse;
-                serializeJson(doc, jsonResponse);
-
-                // HTTPレスポンスをクライアントに送信
-                client.println("HTTP/1.1 200 OK");
-                client.println("Content-Type: application/json");
-                client.println("Connection: close");
-                client.print("Content-Length: ");
-                client.println(jsonResponse.length());
-                client.println();
-                client.print(jsonResponse);
-            } else {
-                 if (DEBUG) Serial.println("[Core 1] Received a connection, but not for /data endpoint.");
-            }
-            
-            // 接続を閉じる
             client.stop();
-            if (DEBUG) Serial.println("[Core 1] Client disconnected.");
         }
 
         handlePeriodicTasks_Core1();
 
     } else {
-        // WiFiが切断された場合、再接続を試みる
         if(DEBUG) Serial.println("[Core 1] WiFi connection lost. Rebooting Core 1 to reconnect...");
-        delay(5000); // 5秒待ってから再起動
+        delay(5000);
         rp2040.restartCore1();
     }
-
     delay(10);
 }
 
-
-//================================================================
-// 定期実行タスク (コア1)
-//================================================================
 void handlePeriodicTasks_Core1() {
     static unsigned long last_tick_time = 0;
     static int scheduler_step = 0;
 
     if (millis() - last_tick_time >= 1000) {
         last_tick_time = millis();
-
         switch (scheduler_step) {
-            case 0:
+            case 0: 
+            case 2: 
                 State::g_trigger_dht_read = true;
                 break;
             case 1:
                 State::g_trigger_wol_poll = true;
                 break;
-            case 2:
-                State::g_trigger_dht_read = true;
-                break;
-            case 3:
-                break;
         }
         scheduler_step = (scheduler_step + 1) % 4;
     }
-
+    
     if (State::g_trigger_wol_poll) {
         State::g_trigger_wol_poll = false;
         Network::pollGasForWol();
@@ -1706,27 +1315,21 @@ void handlePeriodicTasks_Core1() {
     if (State::g_pending_lightning_log_core1) {
         State::g_pending_lightning_log_core1 = false;
         if (DEBUG) Serial.println("[Core 1] Handling pending lightning log...");
-
         int distance = State::sensors.lastLightningDistance;
         char msg[60];
         snprintf(msg, sizeof(msg), "雷を検知しました！\n距離: 約%dkm", distance);
         Network::sendLineNotification(msg);
-
-        char params[128];
-        char encodedSheetName[64];
+        char params[128], encodedSheetName[64];
         Network::urlEncode("雷の受信履歴", encodedSheetName, sizeof(encodedSheetName));
         snprintf(params, sizeof(params), "?sheet=%s&dist=%d", encodedSheetName, distance);
         Network::logDataToGoogleSheet(params);
     }
 
-    if (!State::system.ntpInitialized || time(nullptr) < 100000) {
-        return;
-    }
+    if (!State::system.ntpInitialized || time(nullptr) < 100000) return;
 
     time_t now = time(nullptr);
     struct tm *timeinfo = localtime(&now);
     int currentMinute = timeinfo->tm_min;
-
     static int lastSyncMinute = -1;
     static int lastLogMinute = -1;
 
@@ -1741,7 +1344,7 @@ void handlePeriodicTasks_Core1() {
             }
         }
     }
-
+    
     if (currentMinute % 4 == 0) {
         if (currentMinute != lastSyncMinute) {
             lastSyncMinute = currentMinute;
