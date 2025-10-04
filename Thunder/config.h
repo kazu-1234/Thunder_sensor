@@ -25,8 +25,9 @@ const int numWifiCredentials = sizeof(wifiCredentials) / sizeof(wifiCredentials[
 const char* NTP_SERVER = "ntp.nict.jp";
 
 // --- PCのMACアドレス (Wake on LAN用) ---
-const byte MAC_DESKTOP[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-const byte MAC_SERVER[]  = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// ★★★ MACアドレスを "00:1A:2B:3C:4D:5E" の形式で直接入力してください ★★★
+const char* MAC_DESKTOP = "00:00:00:00:00:00";
+const char* MAC_SERVER  = "00:00:00:00:00:00";
 
 // --- 静的IPアドレス設定 (固定IPを使用する場合) ---
 // trueにするとIPアドレスを固定します。falseにするとDHCPから自動取得します。
@@ -57,4 +58,3 @@ const char* LINE_USER_ID = "-----";
 
 
 #endif // CONFIG_H
-
