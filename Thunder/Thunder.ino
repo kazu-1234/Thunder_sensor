@@ -16,7 +16,7 @@
 #include <LittleFS.h>
 #include <math.h> // for round()
 #include <ArduinoOTA.h> // 標準の無線書き込み(OTA)用ライブラリ
-#include "config.h"      // ★★★ 設定ファイルを読み込む
+#include "config.h"       // ★★★ 設定ファイルを読み込む
 
 //================================================================
 // ★★★ 動作設定 (このエリアは編集可能です) ★★★
@@ -222,10 +222,10 @@ String base64_encode(const uint8_t *data, size_t len) {
 // プロトタイプ宣言
 //================================================================
 namespace Menu { void changeMode(State::Mode newMode); }
-namespace Display { 
+namespace Display {
     void triggerWolMessage(byte target);
-    void printLcdLine(int line, const char* text); 
-    void updateMainDisplay(); 
+    void printLcdLine(int line, const char* text);
+    void updateMainDisplay();
 }
 namespace Network {
 void resyncNtpTimeFromMenu();
@@ -245,7 +245,12 @@ void handleNtpSync();
 void urlEncode(const char* msg, char* encodedMsg, size_t bufferSize);
 void createTempHumParams(char* buffer, size_t bufferSize);
 }
-namespace Utils { void toggleBacklightMode(); void toggleIlluminationMode(); void rebootDevice(); }
+namespace Utils {
+    void toggleBacklightMode();
+    void toggleIlluminationMode();
+    void rebootDevice();
+    bool parseMacAddress(const char* macStr, byte* macArray);
+}
 namespace Sensors {
     void calibrateSensor();
     void updateDht();
@@ -299,10 +304,31 @@ const MenuItem applianceMenu[] = {
 const int APPLIANCE_MENU_COUNT = sizeof(applianceMenu) / sizeof(applianceMenu[0]);
 
 const MenuItem wolMenu[] = {
-    {"1. Desktop PC", [](){ performMenuAction([](){ Network::sendWakeOnLan(MAC_DESKTOP); }, true); }},
-    {"2. Server PC", [](){ performMenuAction([](){ Network::sendWakeOnLan(MAC_SERVER); }, true); }}
+    {"1. Desktop PC", [](){ performMenuAction([](){
+        byte mac[6];
+        if (Utils::parseMacAddress(MAC_DESKTOP, mac)) {
+            Network::sendWakeOnLan(mac);
+        } else {
+            State::lcd.clear();
+            Display::printLcdLine(0, "Invalid MAC Addr");
+            Display::printLcdLine(1, "Check config.h");
+            delay(ACTION_RESULT_DISPLAY_MS);
+        }
+    }, true); }},
+    {"2. Server PC", [](){ performMenuAction([](){
+        byte mac[6];
+        if (Utils::parseMacAddress(MAC_SERVER, mac)) {
+            Network::sendWakeOnLan(mac);
+        } else {
+            State::lcd.clear();
+            Display::printLcdLine(0, "Invalid MAC Addr");
+            Display::printLcdLine(1, "Check config.h");
+            delay(ACTION_RESULT_DISPLAY_MS);
+        }
+    }, true); }}
 };
 const int WOL_MENU_COUNT = sizeof(wolMenu)/sizeof(wolMenu[0]);
+
 
 const MenuItem lightControlMenu[] = {
     {"On", [](){ performMenuAction([](){ Network::sendSwitchBotCommand(DEVICE_ID_LIGHT, "turnOn", "default"); }, false); }},
@@ -388,6 +414,22 @@ const MenuItem* getCurrentMenu(int& count, int& selection) {
 // ユーティリティ関数
 //================================================================
 namespace Utils {
+// MACアドレス文字列 ("XX:XX:XX:XX:XX:XX") をbyte配列に変換する関数
+bool parseMacAddress(const char* macStr, byte* macArray) {
+    // sscanfを使用して6つの16進数値を読み取る
+    // %hhx は unsigned char (Arduinoのbyteと同じ) として読み取るための指定子
+    int values[6];
+    if (sscanf(macStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]) == 6) {
+        // 読み取りが成功した場合、int配列からbyte配列に値をコピー
+        for (int i = 0; i < 6; ++i) {
+            macArray[i] = (byte)values[i];
+        }
+        return true; // 成功
+    }
+    return false; // 失敗
+}
+
 void setRGB(int r, int g, int b) {
     analogWrite(Pins::LED_R, r);
     analogWrite(Pins::LED_G, g);
@@ -462,7 +504,7 @@ void printLcdLine(int line, const char* text) {
     State::lcd.print(buf);
 }
 
-namespace { 
+namespace {
     unsigned long wolMessageEndTime = 0;
     char wolMessage[LCD_COLS + 1] = "";
 
@@ -554,7 +596,7 @@ void drawMenu() {
     int itemCount = 0, currentSelection = 0;
     const Menu::MenuItem* menuItems = Menu::getCurrentMenu(itemCount, currentSelection);
     if (!menuItems) return;
-    
+
     int page = currentSelection / LCD_ROWS;
     for(int i=0; i < LCD_ROWS; i++) {
         int index = page * LCD_ROWS + i;
@@ -605,7 +647,7 @@ void drawUltrasonicMonitorScreen() {
 
 void drawDiagnosticsScreen() {
     static unsigned long lastReadTime = 0;
-    if (millis() - lastReadTime > 1000) { 
+    if (millis() - lastReadTime > 1000) {
         lastReadTime = millis();
 
         printLcdLine(0, "--- Sensor Diag ---");
@@ -620,7 +662,7 @@ void drawDiagnosticsScreen() {
         uint8_t intReg = State::lightning.readInterruptReg();
         snprintf(buf, sizeof(buf), "Spike:%d IntReg:0x%02X", spike, intReg);
         printLcdLine(2, buf);
-        
+
         int irqPinState = digitalRead(Pins::LIGHTNING_IRQ);
         snprintf(buf, sizeof(buf), "IRQ Pin State: %d", irqPinState);
         printLcdLine(3, buf);
@@ -645,7 +687,7 @@ void update() {
             if(State::system.needsRedraw) drawMenu();
             break;
     }
-    
+
     if (State::system.needsRedraw) {
         State::system.needsRedraw = false;
     }
@@ -756,7 +798,7 @@ void addAuthHeaders(HTTPClient& http) {
 
 void sendLineNotification(String message) {
     if (!State::g_wifiConnected) return;
-    
+
     WiFiClientSecure client;
     client.setInsecure();
     HTTPClient http;
@@ -784,7 +826,7 @@ void sendSwitchBotCommand(const char* deviceId, const char* command, const char*
     }
     Display::printLcdLine(0, "Sending Command...");
     Display::printLcdLine(1, "Please wait...");
-    
+
     WiFiClientSecure secureClient;
     secureClient.setInsecure();
     HTTPClient http;
@@ -803,7 +845,7 @@ void sendSwitchBotCommand(const char* deviceId, const char* command, const char*
         }
         http.end();
     }
-    
+
     State::lcd.clear();
     Display::printLcdLine(0, "Command Result");
     Display::printLcdLine(1, success ? "Success!" : "Failed!");
@@ -820,7 +862,7 @@ bool sendWakeOnLanPacket(const byte mac[6]) {
         }
         udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
         udp.write(magicPacket, sizeof(magicPacket));
-        
+
         if (udp.endPacket()) {
             if (DEBUG) Serial.println("WoL packet sent.");
             return true;
@@ -850,7 +892,7 @@ void requestDistance() {
         State::sensors.ultrasonicDistance = -2.0;
         return;
     }
-    
+
     HTTPClient http;
     WiFiClient client;
     if (http.begin(client, "http://" + State::childIpAddress + "/distance")) {
@@ -871,7 +913,7 @@ void requestDistance() {
 
 void handleNtpSync() {
     if (!State::g_wifiConnected || State::system.ntpInitialized) return;
-        
+
     if (!State::system.isAutoResync) {
         if (DEBUG) Serial.println("[Core 1] NTP sync started...");
     }
@@ -879,7 +921,7 @@ void handleNtpSync() {
 
     setenv("TZ", "JST-9", 1);
     tzset();
-    
+
     NTP.begin(NTP_SERVER);
 
     bool syncSuccess = false;
@@ -937,9 +979,9 @@ void resyncNtpTimeFromMenu() {
         delay(ACTION_RESULT_DISPLAY_MS);
         return;
     }
-    
+
     resyncNtpTime();
-    
+
     Display::printLcdLine(1, State::system.ntpInitialized ? "Success!" : "Failed!");
     delay(ACTION_RESULT_DISPLAY_MS);
 }
@@ -1017,7 +1059,7 @@ void manualLogToSheet() {
     }
     Display::printLcdLine(0, "Logging to Sheet...");
     Display::printLcdLine(1, "Please wait...");
-    
+
     char params[128];
     createTempHumParams(params, sizeof(params));
 
@@ -1034,16 +1076,16 @@ void manualLogToSheet() {
 
 void pollGasForWol() {
     if (String(GAS_URL_WOL).startsWith("-----")) return;
-    
+
     WiFiClientSecure client;
     HTTPClient http;
     client.setInsecure();
-    
+
     if (DEBUG) Serial.print("[Core 1] Polling GAS for WoL signal...");
 
     char signalCheckUrl[128];
     snprintf(signalCheckUrl, sizeof(signalCheckUrl), "%s?action=signal", GAS_URL_WOL);
-    
+
     if (http.begin(client, signalCheckUrl)) {
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         http.setTimeout(3800);
@@ -1052,12 +1094,12 @@ void pollGasForWol() {
 
         if (httpCode == HTTP_CODE_OK) {
             String payload = http.getString();
-            payload.trim(); 
+            payload.trim();
 
             if (payload == "TRIGGER") {
                 if (DEBUG) Serial.println("  -> Trigger detected! Getting command...");
                 http.end();
-                
+
                 delay(500);
 
                 char commandGetUrl[128];
@@ -1069,16 +1111,26 @@ void pollGasForWol() {
                         payload = http.getString();
                         payload.trim();
                         if (DEBUG) Serial.printf("  -> Command received: [%s]\n", payload.c_str());
-                        
+
                         if (payload == "デスクトップPC起動") {
-                            if (sendWakeOnLanPacket(MAC_DESKTOP)) {
-                                State::g_wolTarget = 1;
-                                State::g_wolTriggered = true;
+                            byte mac[6];
+                            if (Utils::parseMacAddress(MAC_DESKTOP, mac)) {
+                                if (sendWakeOnLanPacket(mac)) {
+                                    State::g_wolTarget = 1;
+                                    State::g_wolTriggered = true;
+                                }
+                            } else {
+                                if (DEBUG) Serial.println("[Core 1] Invalid Desktop MAC format in config.h");
                             }
                         } else if (payload == "サーバーPC起動") {
-                            if (sendWakeOnLanPacket(MAC_SERVER)) {
-                                State::g_wolTarget = 2;
-                                State::g_wolTriggered = true;
+                            byte mac[6];
+                             if (Utils::parseMacAddress(MAC_SERVER, mac)) {
+                                if (sendWakeOnLanPacket(mac)) {
+                                    State::g_wolTarget = 2;
+                                    State::g_wolTriggered = true;
+                                }
+                            } else {
+                                if (DEBUG) Serial.println("[Core 1] Invalid Server MAC format in config.h");
                             }
                         }
                     } else {
@@ -1122,7 +1174,7 @@ void handleLightning() {
     delay(5);
     int intVal = State::lightning.readInterruptReg();
     if (DEBUG) Serial.printf("Interrupt Register: 0x%02X\n", intVal);
-    
+
     char timestamp[20];
     if (intVal == 0x01 || intVal == 0x08) {
         time_t now = time(nullptr);
@@ -1149,7 +1201,7 @@ void handleLightning() {
         int distance = State::lightning.distanceToStorm();
         State::sensors.lastLightningDistance = distance;
         State::sensors.lastEventType = "Lightning";
-        
+
         addHistoryRecord("Lightning", distance, timestamp);
 
         State::g_pending_lightning_log_core1 = true;
@@ -1163,7 +1215,7 @@ void updateDht() {
 
     if (!isnan(temp_raw) && !isnan(hum_raw)) {
         State::sensors.temperature = round(temp_raw * 10.0) / 10.0;
-        
+
         if (hum_raw >= 0 && hum_raw <= 1.0) {
             hum_raw *= 100.0;
         }
@@ -1174,6 +1226,8 @@ void updateDht() {
 }
 
 void update() {
+    // 雷センサーの割り込みを最優先で処理する
+    // loop()の先頭で呼び出されることで、他の処理より先に実行される
     if (State::lightningInterruptFlag) {
         handleLightning();
     }
@@ -1193,7 +1247,6 @@ void calibrateSensor() {
 }
 
 void init() {
-    // 【修正点】DHT20の初期化に失敗した場合、LCDにエラーを表示して停止するように変更
     if (State::dht20.begin() != 0) {
         if (DEBUG) Serial.println("DHT20 Error! Halting.");
         Display::printLcdLine(1, "DHT20 COM FAILED!");
@@ -1204,7 +1257,7 @@ void init() {
     delay(1000);
     State::lcd.clear();
     Display::printLcdLine(0, "System Starting...");
-    
+
     State::system.currentNoiseLevel = INITIAL_NOISE_LEVEL;
     if (!State::lightning.begin(Wire)) {
         if (DEBUG) Serial.println("AS3935 Error! Halting.");
@@ -1213,12 +1266,12 @@ void init() {
         while(1) { delay(10); }
     } else {
         State::lightning.resetSettings();
-        
+
         State::lightning.setIndoorOutdoor(OUTDOOR);
         State::lightning.setNoiseLevel(State::system.currentNoiseLevel);
         State::lightning.watchdogThreshold(LIGHTNING_WATCHDOG_THRESHOLD);
         State::lightning.spikeRejection(LIGHTNING_SPIKE_REJECTION);
-        
+
         if (DEBUG) {
          Serial.println("--- AS3935 Initial Settings ---");
          Serial.printf("Watchdog Threshold: Set to %d, Read back %d\n", LIGHTNING_WATCHDOG_THRESHOLD, State::lightning.readWatchdogThreshold());
@@ -1227,9 +1280,17 @@ void init() {
          Serial.println("---------------------------------");
         }
         Display::printLcdLine(1, "Lightning Sensor OK");
-        delay(1500);
+        delay(1000);
+        
+        // 起動直後の誤検知を防ぐため、センサー安定用の待機時間を追加
+        State::lcd.clear();
+        Display::printLcdLine(0, "Stabilizing Sensor");
+        Display::printLcdLine(1, "Please wait...");
+        if (DEBUG) Serial.println("[Core 0] Waiting for AS3935 to stabilize before attaching interrupt...");
+        delay(2000); // 2秒間待機してセンサーを安定させる
     }
     attachInterrupt(digitalPinToInterrupt(Pins::LIGHTNING_IRQ), handleLightningInterrupt, RISING);
+    if (DEBUG) Serial.println("[Core 0] Lightning interrupt attached.");
 }
 }
 
@@ -1373,12 +1434,12 @@ void setup() {
     // 起動中はバックライトとLEDを点灯
     digitalWrite(Pins::LCD_BACKLIGHT, HIGH);
     Utils::setRGB(255, 255, 255);
-    
+
     Display::init(); // "System Starting..."
 
     // Wi-Fi接続処理の前に、センサー類を初期化
     Sensors::init();
-    
+
     // Core1を起動して、Wi-Fi接続をバックグラウンドで開始させる
     if(DEBUG) Serial.println("[Core 0] Starting Core 1 for network tasks.");
     rp2040.restartCore1();
@@ -1403,33 +1464,34 @@ void setup() {
         Display::printLcdLine(0, "WiFi Connected!");
         Display::printLcdLine(1, WiFi.localIP().toString().c_str());
         if (DEBUG) Serial.println("[Core 0] WiFi connection confirmed from Core 1.");
-        delay(2000); 
+        delay(2000);
     }
-    
+
     Menu::changeMode(State::MAIN_DISPLAY);
-    
+
     // メイン画面に切り替わったらLEDを消灯し、バックライトモードを適用
     Utils::setRGB(0, 0, 0);
     if (!State::system.backlightAlwaysOn) {
         digitalWrite(Pins::LCD_BACKLIGHT, LOW);
     }
-    
+
     if (DEBUG) Serial.println("--- [Core 0] Boot Complete, Main Screen Active ---");
 }
 
 void loop() {
+    // 雷センサーの割り込みフラグチェックをループの最優先事項にする
+    Sensors::update();
+
     if (State::g_wolTriggered) {
         State::g_wolTriggered = false;
         Display::triggerWolMessage(State::g_wolTarget);
         State::g_wolTarget = 0;
     }
-    
+
     Input::handleButton();
     Display::update();
     Menu::checkInactivity();
-    
-    Sensors::update();
-    
+
     if (State::g_trigger_dht_read) {
         State::g_trigger_dht_read = false;
         if (DEBUG) Serial.println("[Core 0] Reading DHT sensor (triggered by Core 1)...");
@@ -1473,7 +1535,7 @@ void loop() {
 //================================================================
 void setup1() {
     if (DEBUG) Serial.println("[Core 1] Core 1 started. Initializing network...");
-    
+
     WiFi.mode(WIFI_STA);
     if (USE_STATIC_IP) {
         if (DEBUG) Serial.println("[Core 1] Configuring static IP address...");
@@ -1482,19 +1544,14 @@ void setup1() {
         IPAddress subnet(SUBNET_BYTES);
         IPAddress primaryDNS(PRIMARY_DNS_BYTES);
         IPAddress secondaryDNS(SECONDARY_DNS_BYTES);
-        
-        // 【修正点】コンパイルエラーに基づき、Pico W環境で利用可能なWiFi.config関数の引数に合わせます。
-        // 書式: config(IPアドレス, DNSサーバー, ゲートウェイ, サブネット)
+
         WiFi.config(local_IP, primaryDNS, gateway, subnet);
-        
-        // 【追加】setDNS() を使用して、プライマリおよびセカンダリDNSサーバーを明示的に設定します。
-        // これにより、両方のDNSサーバーが確実に設定されます。
         WiFi.setDNS(primaryDNS, secondaryDNS);
     }
 
     int credIndex = 0;
     unsigned long total_start_time = millis();
-    
+
     // 複数のWiFi設定を順番に試す
     while(WiFi.status() != WL_CONNECTED && (millis() - total_start_time < 60000)) { // 全体で60秒試す
         const char* current_ssid = wifiCredentials[credIndex].ssid;
@@ -1502,7 +1559,7 @@ void setup1() {
         if (strlen(current_ssid) > 0 && strcmp(current_ssid, "-----") != 0) {
             if (DEBUG) Serial.printf("[Core 1] Attempting to connect to SSID: %s\n", current_ssid);
             WiFi.begin(current_ssid, wifiCredentials[credIndex].password);
-            
+
             unsigned long startTime = millis();
             // 1つのSSIDあたり15秒試す
             while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
@@ -1540,9 +1597,66 @@ void loop1() {
 
         WiFiClient client = State::server.accept();
         if(client) {
-             if (State::childIpAddress == "") Utils::blinkLED("blue", 3, 150);
+            if (DEBUG) Serial.println("[Core 1] Client connected.");
+            
+            // ★★★ 修正点: 初回接続時のみLEDを点滅させる ★★★
+            // childIpAddressが空の時が初回接続と判断
+            if (State::childIpAddress == "") {
+                // LEDを青色で3回点滅させる
+                Utils::blinkLED("blue", 3, 150);
+            }
+            
+            // 子機からのIPアドレスを保存（超音波センサー用）
             State::childIpAddress = client.remoteIP().toString();
+
+            // HTTPリクエストの最初の行を読み取る
+            String req = client.readStringUntil('\r');
+            client.flush();
+
+            // リクエストが "/data" へのGETリクエストか確認
+            if (req.indexOf("GET /data") != -1) {
+                if (DEBUG) Serial.println("[Core 1] /data endpoint requested. Sending JSON response.");
+                // JSONドキュメントを作成
+                JsonDocument doc;
+                doc["temperature"] = State::sensors.temperature;
+                doc["humidity"] = State::sensors.humidity;
+                doc["last_event_type"] = State::sensors.lastEventType;
+                doc["last_lightning_dist"] = State::sensors.lastLightningDistance;
+
+                // C-style string (char array) を安全にコピー
+                char eventTimeBuffer[20];
+                strncpy(eventTimeBuffer, State::sensors.lastEventTime, sizeof(eventTimeBuffer));
+                eventTimeBuffer[sizeof(eventTimeBuffer) - 1] = '\0'; // 念のため終端文字を追加
+                doc["last_event_time"] = eventTimeBuffer;
+
+                // 雷履歴をJSON配列として追加
+                JsonArray historyArray = doc["history"].to<JsonArray>();
+                for (int i = 0; i < State::history.count; i++) {
+                    int idx = (State::history.index - 1 - i + HISTORY_SIZE) % HISTORY_SIZE;
+                    JsonObject historyObj = historyArray.add<JsonObject>();
+                    historyObj["timestamp"] = State::history.records[idx].timestamp;
+                    historyObj["type"] = State::history.records[idx].type;
+                    historyObj["distance"] = State::history.records[idx].distance;
+                }
+
+                String jsonResponse;
+                serializeJson(doc, jsonResponse);
+
+                // HTTPレスポンスをクライアントに送信
+                client.println("HTTP/1.1 200 OK");
+                client.println("Content-Type: application/json");
+                client.println("Connection: close");
+                client.print("Content-Length: ");
+                client.println(jsonResponse.length());
+                client.println();
+                client.print(jsonResponse);
+            } else {
+                 if (DEBUG) Serial.println("[Core 1] Received a connection, but not for /data endpoint.");
+            }
+            
+            // 接続を閉じる
             client.stop();
+            if (DEBUG) Serial.println("[Core 1] Client disconnected.");
         }
 
         handlePeriodicTasks_Core1();
@@ -1553,7 +1667,7 @@ void loop1() {
         delay(5000); // 5秒待ってから再起動
         rp2040.restartCore1();
     }
-    
+
     delay(10);
 }
 
@@ -1583,7 +1697,7 @@ void handlePeriodicTasks_Core1() {
         }
         scheduler_step = (scheduler_step + 1) % 4;
     }
-    
+
     if (State::g_trigger_wol_poll) {
         State::g_trigger_wol_poll = false;
         Network::pollGasForWol();
@@ -1597,7 +1711,7 @@ void handlePeriodicTasks_Core1() {
         char msg[60];
         snprintf(msg, sizeof(msg), "雷を検知しました！\n距離: 約%dkm", distance);
         Network::sendLineNotification(msg);
-        
+
         char params[128];
         char encodedSheetName[64];
         Network::urlEncode("雷の受信履歴", encodedSheetName, sizeof(encodedSheetName));
@@ -1648,5 +1762,4 @@ void handlePeriodicTasks_Core1() {
         }
     }
 }
-
 
