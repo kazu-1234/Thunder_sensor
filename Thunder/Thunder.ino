@@ -1,3 +1,4 @@
+// Ver 7.0
 //================================================================
 // ライブラリ
 //================================================================
@@ -17,13 +18,12 @@
 #include <LittleFS.h>
 #include <math.h> // for round()
 #include <ArduinoOTA.h> // 標準の無線書き込み(OTA)用ライブラリ
-#include "pico/multicore.h" // マルチコア機能用ライブラリ
 
-// ★★★ 設定ファイルをインクルード ★★★
+// ★追加: 設定ファイルを読み込む
 #include "config.h"
 
 //================================================================
-// ★★★ 動作設定 (ここは編集可能です) ★★★
+// ★★★ 設定項目 (本体の動作設定) ★★★
 //================================================================
 // --- 雷センサー感度設定 ---
 const uint8_t LIGHTNING_WATCHDOG_THRESHOLD = 1; // 雷検知の強さの閾値 (調整範囲: 1～10)
@@ -35,6 +35,7 @@ const uint8_t INITIAL_NOISE_LEVEL = 1;          // 周囲の環境ノイズの�
 const unsigned long LONG_PRESS_DURATION_MS = 1000;
 const unsigned long INACTIVITY_TIMEOUT_MS = 5000;
 const unsigned long BACKLIGHT_DURATION_MS = 3000;
+const unsigned long SENSOR_READ_INTERVAL_MS = 2000; // センサー読み取り間隔
 const unsigned long IP_DISPLAY_DURATION_MS = 5000;
 const int HISTORY_SIZE = 3;
 const int LCD_COLS = 20;
@@ -83,6 +84,8 @@ struct SystemState {
     uint8_t currentNoiseLevel = 2;
     bool initialLogSent = false;
     bool pendingLightningLog = false;
+    bool dht20_initialized = false;
+    bool as3935_initialized = false;
 };
 
 // --- センサーデータ ---
@@ -114,11 +117,6 @@ struct TimerState {
     unsigned long lastActivity = 0;
     unsigned long backlightOn = 0;
 };
-
-// ★追加: WoL起動メッセージ表示用の状態
-String wolMessage = "";
-unsigned long wolMessageDisplayTime = 0;
-
 
 // --- 暗号化コンテキスト ---
 struct SHA256_CTX { uint8_t data[64]; uint32_t datalen; uint64_t bitlen; uint32_t state[8]; };
@@ -219,23 +217,17 @@ void sendSwitchBotCommand(const char* deviceId, const char* command, const char*
 void resyncNtpTime();
 void getSwitchBotDeviceList();
 void sendLineTestMessage();
-void sendWakeOnLan(const char* macString);
+void sendWakeOnLan(const char* macStr);
 void requestDistance();
 void showIpAddressAndHold();
 bool connectToWiFi(bool showOnLcd = true);
 void logDataToGoogleSheet(String params);
 void manualLogToSheet();
-void pollWolFromGas();
 }
 namespace Utils { void toggleBacklightMode(); void toggleIlluminationMode(); void rebootDevice(); }
-namespace Sensors { 
-    void calibrateSensor(); 
-    void checkInterrupts();
-    void updateDht();
-}
+namespace Sensors { void init(); void calibrateSensor(); }
 void handlePeriodicTasks();
 void handlePendingNetworkTasks();
-void core1_entry(); // Core 1で実行される関数のプロトタイプ宣言
 
 //================================================================
 // メニュー定義
@@ -371,7 +363,6 @@ const MenuItem* getCurrentMenu(int& count, int& selection) {
 // ユーティリティ関数
 //================================================================
 namespace Utils {
-// RGB LEDの色を設定する (R, G, Bは0-255)
 void setRGB(int r, int g, int b) {
     analogWrite(Pins::LED_R, r);
     analogWrite(Pins::LED_G, g);
@@ -391,9 +382,6 @@ void blinkLED(String color, int times, int duration) {
 }
 
 void handleSmoothIllumination() {
-    // WoLメッセージ表示中はイルミネーションを一時停止
-    if (State::wolMessage != "") return;
-
     unsigned long hue = millis() / 10;
     hue %= 360;
     float s = 1.0, v = 1.0, r, g, b;
@@ -461,18 +449,12 @@ namespace { // 無名名前空間でこのファイル内からのみアクセ�
         printLcdLine(0, buf);
     }
 
+    // ★★★ 修正: 呼び出し箇所のエラーを修正 ★★★
     void drawSensors() {
-        // WoLメッセージがあれば優先して表示
-        if (State::wolMessage != "" && millis() - State::wolMessageDisplayTime < 3000) {
-            char buf[LCD_COLS + 1];
-            snprintf(buf, sizeof(buf), "%-*s", LCD_COLS, State::wolMessage.c_str());
-            printLcdLine(1, buf);
-            return; // 温湿度表示をスキップ
-        }
-        
-        // 通常の温湿度表示
         char buf[LCD_COLS + 1];
-        if (State::sensors.temperature > -100) {
+        if (!State::system.dht20_initialized) {
+            snprintf(buf, sizeof(buf), "DHT20 Init Failed!");
+        } else if (State::sensors.temperature > -999.0) {
             snprintf(buf, sizeof(buf), "T:%.1fC  H:%.1f%%", State::sensors.temperature, State::sensors.humidity);
         } else {
             snprintf(buf, sizeof(buf), "Sensor Reading...");
@@ -480,6 +462,7 @@ namespace { // 無名名前空間でこのファイル内からのみアクセ�
         printLcdLine(1, buf);
     }
 
+    // ★★★ 修正: 呼び出し箇所のエラーを修正 ★★★
     void drawLightningInfo() {
         char buf[LCD_COLS + 1];
         if (State::sensors.lastEventType == "Lightning") {
@@ -493,7 +476,11 @@ namespace { // 無名名前空間でこのファイル内からのみアクセ�
             printLcdLine(3, "Distance: Noise");
         } else {
             printLcdLine(2, "Last Event: None");
-            printLcdLine(3, "Distance: ---");
+            if (!State::system.as3935_initialized){
+                printLcdLine(3, "AS3935 Init Failed");
+            } else {
+                printLcdLine(3, "Distance: ---");
+            }
         }
     }
 }
@@ -501,7 +488,8 @@ namespace { // 無名名前空間でこのファイル内からのみアクセ�
 // メイン画面の表示を更新する
 void updateMainDisplay() {
     static unsigned long lastTimeUpdate = 0;
-    
+    static unsigned long lastSensorDraw = 0;
+
     // 画面全体を再描画する必要があるか
     if (State::system.forceMainScreenRedraw) {
         State::lcd.clear();
@@ -509,13 +497,17 @@ void updateMainDisplay() {
         drawSensors();
         drawLightningInfo();
         lastTimeUpdate = millis();
+        lastSensorDraw = millis();
     } else {
         // 1秒ごとに時刻表示を更新
         if (millis() - lastTimeUpdate > 1000) {
             drawTime();
-            // WoLメッセージの表示/非表示もここで処理される
-            drawSensors(); 
             lastTimeUpdate = millis();
+        }
+        // センサーの読み取り間隔に合わせて表示も更新
+        if (millis() - lastSensorDraw > SENSOR_READ_INTERVAL_MS) {
+            drawSensors();
+            lastSensorDraw = millis();
         }
     }
 }
@@ -585,13 +577,14 @@ void drawDiagnosticsScreen() {
         printLcdLine(0, "--- Sensor Diag ---");
         char buf[LCD_COLS + 1];
 
+        // 公開されている関数を使ってセンサーの状態を表示
         uint8_t noise = State::lightning.readNoiseLevel();
         uint8_t watchdog = State::lightning.readWatchdogThreshold();
         snprintf(buf, sizeof(buf), "Noise:%d Watchdog:%d", noise, watchdog);
         printLcdLine(1, buf);
 
         uint8_t spike = State::lightning.readSpikeRejection();
-        uint8_t intReg = State::lightning.readInterruptReg();
+        uint8_t intReg = State::lightning.readInterruptReg(); // 割り込みレジスタは読める
         snprintf(buf, sizeof(buf), "Spike:%d IntReg:0x%02X", spike, intReg);
         printLcdLine(2, buf);
         
@@ -605,8 +598,8 @@ void drawDiagnosticsScreen() {
 // 現在のモードに応じて画面を更新する
 void update() {
     if (State::system.needsRedraw) {
-        State::lcd.clear();
-        State::system.forceMainScreenRedraw = true;
+        State::lcd.clear(); // モードが切り替わったら一度画面をクリア
+        State::system.forceMainScreenRedraw = true; // メイン画面に戻った時に全体再描画を強制
     }
 
     switch(State::menu.currentMode) {
@@ -622,7 +615,7 @@ void update() {
         case State::SENSOR_DIAGNOSTICS:
             drawDiagnosticsScreen();
             break;
-        default:
+        default: // MENU, DEVICE_CONTROLなど
             if(State::system.needsRedraw) drawMenu();
             break;
     }
@@ -646,41 +639,52 @@ namespace Network {
 // OTA(無線書き込み)機能の初期化
 void initOTA() {
     if (WiFi.status() == WL_CONNECTED) {
+        // Arduino IDEの「ポート」に表示される名前を設定
         ArduinoOTA.setHostname("pico-lightning-sensor");
 
+        // 書き込み中のイベントをシリアルモニタに表示する設定
         ArduinoOTA.onStart([]() {
             String type;
-            if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
-            else type = "filesystem";
-            if (DEBUG) Serial.println("Start updating " + type);
+            if (ArduinoOTA.getCommand() == U_FLASH)
+                type = "sketch";
+            else // U_SPIFFS
+                type = "filesystem";
+            if (DEBUG) Serial.println("[OTA] Start updating " + type);
         });
-        ArduinoOTA.onEnd([]() { if (DEBUG) Serial.println("\nEnd"); });
+        ArduinoOTA.onEnd([]() {
+            if (DEBUG) Serial.println("\n[OTA] End");
+        });
         ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-            if (DEBUG) Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+            if (DEBUG) Serial.printf("[OTA] Progress: %u%%\r", (progress / (total / 100)));
         });
         ArduinoOTA.onError([](ota_error_t error) {
-            if (DEBUG) Serial.printf("Error[%u]: ", error);
-            if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-            else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-            else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-            else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-            else if (error == OTA_END_ERROR) Serial.println("End Failed");
+            if (DEBUG) {
+                Serial.printf("[OTA] Error[%u]: ", error);
+                if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+                else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+                else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+                else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+                else if (error == OTA_END_ERROR) Serial.println("End Failed");
+            }
         });
 
+        // OTAを開始
         ArduinoOTA.begin();
-        if (DEBUG) Serial.println("OTA Ready. Hostname: pico-lightning-sensor");
+        if (DEBUG) Serial.println("[OTA] Ready. Hostname: pico-lightning-sensor");
     } else {
-        if (DEBUG) Serial.println("OTA Init Failed: WiFi not connected.");
+        if (DEBUG) Serial.println("[OTA] Init Failed: WiFi not connected.");
     }
 }
 
+// URLエンコードを行う関数
 String urlEncode(const char* msg) {
     const char *hex = "0123456789abcdef";
     String encodedMsg = "";
     while (*msg != '\0') {
-        if (('a' <= *msg && *msg <= 'z') || ('A' <= *msg && *msg <= 'Z') ||
-            ('0' <= *msg && *msg <= '9') || *msg == '-' || *msg == '_' ||
-            *msg == '.' || *msg == '~') {
+        if (('a' <= *msg && *msg <= 'z')
+                || ('A' <= *msg && *msg <= 'Z')
+                || ('0' <= *msg && *msg <= '9')
+                || *msg == '-' || *msg == '_' || *msg == '.' || *msg == '~') {
             encodedMsg += *msg;
         } else {
             encodedMsg += '%';
@@ -694,6 +698,7 @@ String urlEncode(const char* msg) {
 
 String createTempHumParams() {
     if (State::sensors.temperature > -100) {
+        // 日本語のシート名をurlEncode関数でエンコードする
         return "?sheet=" + urlEncode("温湿度") + "&temp=" + String(State::sensors.temperature, 1) + "&hum=" + String(State::sensors.humidity, 1);
     }
     return "";
@@ -764,20 +769,38 @@ void sendSwitchBotCommand(const char* deviceId, const char* command, const char*
     }
 }
 
-void parseMacAddress(const char* macStr, byte* macBytes) {
-    sscanf(macStr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-           &macBytes[0], &macBytes[1], &macBytes[2],
-           &macBytes[3], &macBytes[4], &macBytes[5]);
+// MACアドレス文字列("XX:XX:XX:XX:XX:XX")をbyte配列に変換する関数
+bool parseMacAddress(const char* macStr, byte* macArray) {
+    // 文字列の長さが17文字でない場合はエラー
+    if (strlen(macStr) != 17) {
+        return false;
+    }
+    // sscanfを使用して6つの16進数値を読み取る
+    int values[6];
+    int count = sscanf(macStr, "%x:%x:%x:%x:%x:%x", &values[0], &values[1], &values[2], &values[3], &values[4], &values[5]);
+    // 6個の値を正しく読み取れなかった場合はエラー
+    if (count != 6) {
+        return false;
+    }
+    // 読み取った値をbyte配列に格納
+    for (int i = 0; i < 6; ++i) {
+        macArray[i] = (byte)values[i];
+    }
+    return true; // 成功
 }
 
-void sendWakeOnLan(const char* macString) {
-    // この関数はCore 0 (メニュー操作) と Core 1 (LINE経由) の両方から呼ばれる可能性がある
-    if (DEBUG) {
-      Serial.printf("Attempting to send WoL packet to %s\n", macString);
-    }
+// MACアドレスを文字列(const char*)で受け取るように変更
+void sendWakeOnLan(const char* macStr) {
+    State::lcd.clear();
+    Display::printLcdLine(0, "Sending WoL Packet...");
     
     byte mac[6];
-    parseMacAddress(macString, mac);
+    // MACアドレス文字列をbyte配列に変換
+    if (!parseMacAddress(macStr, mac)) {
+        Display::printLcdLine(1, "Invalid MAC Addr!");
+        if (DEBUG) Serial.printf("[WoL] Error: Invalid MAC address format in config.h: %s\n", macStr);
+        return; // 変換に失敗した場合は処理を中断
+    }
 
     WiFiUDP udp;
     if (udp.begin(9)) {
@@ -789,13 +812,11 @@ void sendWakeOnLan(const char* macString) {
         udp.beginPacket(IPAddress(255, 255, 255, 255), 9);
         udp.write(magicPacket, sizeof(magicPacket));
         udp.endPacket();
-        if (DEBUG) {
-            Serial.println("WoL packet sent successfully.");
-        }
+        Display::printLcdLine(1, "Packet Sent!");
+        if (DEBUG) Serial.println("[WoL] Magic packet sent.");
     } else {
-        if (DEBUG) {
-            Serial.println("UDP setup for WoL failed.");
-        }
+        Display::printLcdLine(1, "UDP Setup Failed!");
+        if (DEBUG) Serial.println("[WoL] UDP setup failed.");
     }
 }
 
@@ -823,42 +844,50 @@ void requestDistance() {
 }
 
 void handleConnection() {
+    // WiFiに接続済みで、まだNTP同期が完了していない場合に実行
     if (WiFi.status() == WL_CONNECTED && !State::system.ntpInitialized) {
+        
         if (!State::system.isAutoResync) {
             Utils::blinkLED("green", 2, 100);
-            if (DEBUG) Serial.println("WiFi Connected. Initializing NTP...");
+            if (DEBUG) Serial.println("[Network] WiFi Connected. Initializing NTP...");
+            Display::printLcdLine(0, "Syncing Time (NTP)...");
+            Display::printLcdLine(1, "");
+            Display::printLcdLine(2, "");
+            Display::printLcdLine(3, "");
         }
         State::system.isAutoResync = false;
+
         setenv("TZ", "JST-9", 1);
         tzset();
-        if (DEBUG) Serial.print("Attempting to sync time with NTP server");
-        NTP.begin(NTP_SERVER);
+
+        if (DEBUG) Serial.print("[Network] Attempting to sync time with NTP server");
         
+        NTP.begin(NTP_SERVER);
+
         bool syncSuccess = false;
-        char buf[LCD_COLS + 1];
-        // ★修正: LCDにアニメーションを表示しながらNTP同期
-        for (int i = 0; i < 60; i++) { // 30秒タイムアウト (0.5秒 x 60回)
+        // 最大30回リトライ (約15秒)
+        for (int i = 0; i < 30; i++) {
+            // time()が1970年1月1日からの秒数を返す。十分に大きい値=同期成功とみなす
             if (time(nullptr) > 100000) {
                 syncSuccess = true;
-                break;
+                break; // 同期成功したのでループを抜ける
             }
-            snprintf(buf, sizeof(buf), "Syncing Time (NTP)%s", (i%4==0) ? ".  " : (i%4==1) ? ".. " : (i%4==2) ? "..." : " ..");
-            Display::printLcdLine(0, buf);
-            
             if (DEBUG) Serial.print(".");
             delay(500);
         }
 
         if (syncSuccess) {
-            if (DEBUG) Serial.println("\nNTP Sync Successful!");
-            State::system.ntpInitialized = true;
-            State::server.begin();
+            if (DEBUG) Serial.println("\n[Network] NTP Sync Successful!");
+            State::system.ntpInitialized = true; // 同期成功フラグを立てる
+            State::server.begin(); // Webサーバーを開始
+            // メイン画面の再描画を強制する
             State::system.forceMainScreenRedraw = true;
         } else {
-            if (DEBUG) Serial.println("\nNTP Sync Failed! (Timeout)");
+            if (DEBUG) Serial.println("\n[Network] NTP Sync Failed! (Timeout)");
             Display::printLcdLine(0, "NTP Sync Failed!");
             Display::printLcdLine(1, "Check network/DNS.");
             delay(3000);
+            // ntpInitializedはfalseのままなので、次の周期で再試行される
         }
     }
 }
@@ -866,10 +895,14 @@ void handleConnection() {
 void handleServerClient() {
     WiFiClient client = State::server.accept();
     if (client) {
-        if (State::childIpAddress == "") Utils::blinkLED("blue", 3, 150);
+        if (State::childIpAddress == "") {
+            Utils::blinkLED("blue", 3, 150);
+        }
         State::childIpAddress = client.remoteIP().toString();
         unsigned long timeout = millis();
-        while(!client.available() && millis() - timeout < 500) delay(1);
+        while(!client.available() && millis() - timeout < 500) {
+            delay(1);
+        }
         JsonDocument responseDoc;
         responseDoc["temperature"] = State::sensors.temperature;
         responseDoc["humidity"] = State::sensors.humidity;
@@ -888,19 +921,25 @@ void handleServerClient() {
 }
 
 bool connectToWiFi(bool showOnLcd) {
-    if (DEBUG) Serial.println("Starting WiFi connection...");
-    if (showOnLcd) Display::printLcdLine(0, "Connecting WiFi...");
+    if (DEBUG) Serial.println("[Network] Starting WiFi connection...");
+    if (showOnLcd) {
+        Display::printLcdLine(0, "Connecting WiFi...");
+    }
     
     for (int i = 0; i < numWifiCredentials; i++) {
         if (strlen(wifiCredentials[i].ssid) == 0) continue;
-        if (DEBUG) Serial.printf("Attempting to connect to SSID: %s\n", wifiCredentials[i].ssid);
+
+        if (DEBUG) Serial.printf("[Network] Attempting to connect to SSID: %s\n", wifiCredentials[i].ssid);
         if (showOnLcd) {
             char lcd_buf[21];
             snprintf(lcd_buf, sizeof(lcd_buf), "SSID: %s", wifiCredentials[i].ssid);
             Display::printLcdLine(1, lcd_buf);
-            Display::printLcdLine(2, "Connecting..."); Display::printLcdLine(3, "");
+            Display::printLcdLine(2, "Connecting...");
+            Display::printLcdLine(3, "");
         }
+
         WiFi.begin(wifiCredentials[i].ssid, wifiCredentials[i].password);
+
         unsigned long startTime = millis();
         while (WiFi.status() != WL_CONNECTED) {
             if (millis() - startTime > 15000) {
@@ -909,13 +948,15 @@ bool connectToWiFi(bool showOnLcd) {
                 delay(100);
                 break;
             }
-            delay(500); if (DEBUG) Serial.print(".");
+            delay(500);
+            if (DEBUG) Serial.print(".");
         }
+
         if (WiFi.status() == WL_CONNECTED) {
             if (DEBUG) {
-                Serial.println("\nWiFi connected!");
-                Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
-                Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+                Serial.println("\n[Network] WiFi connected!");
+                Serial.printf("  - SSID: %s\n", WiFi.SSID().c_str());
+                Serial.printf("  - IP Address: %s\n", WiFi.localIP().toString().c_str());
             }
             if (showOnLcd) {
                 Display::printLcdLine(0, "WiFi Connected!");
@@ -926,7 +967,8 @@ bool connectToWiFi(bool showOnLcd) {
             return true;
         }
     }
-    if (DEBUG) Serial.println("\nFailed to connect to any WiFi network.");
+    
+    if (DEBUG) Serial.println("\n[Network] Failed to connect to any WiFi network.");
     if (showOnLcd) {
         Display::printLcdLine(0, "WiFi Connect Fail");
         Display::printLcdLine(1, "Check settings.");
@@ -938,14 +980,15 @@ bool connectToWiFi(bool showOnLcd) {
 void checkWiFiConnection() {
     static unsigned long lastReconnectAttempt = 0;
     const unsigned long reconnectInterval = 60000;
+
     if (WiFi.status() != WL_CONNECTED) {
         if (millis() - lastReconnectAttempt > reconnectInterval) {
-            if (DEBUG) Serial.println("WiFi disconnected. Attempting to reconnect...");
+            if (DEBUG) Serial.println("[Network] WiFi disconnected. Attempting to reconnect...");
             if (connectToWiFi(false)) {
-                if (DEBUG) Serial.println("WiFi reconnected successfully.");
+                if (DEBUG) Serial.println("[Network] WiFi reconnected successfully.");
                 State::system.ntpInitialized = false;
             } else {
-                if (DEBUG) Serial.println("Failed to reconnect. Will try again in 1 minute.");
+                if (DEBUG) Serial.println("[Network] Failed to reconnect. Will try again in 1 minute.");
             }
             lastReconnectAttempt = millis();
         }
@@ -954,97 +997,45 @@ void checkWiFiConnection() {
 
 void logDataToGoogleSheet(String params) {
     if (WiFi.status() != WL_CONNECTED || String(GAS_URL).startsWith("-----")) {
-        if (DEBUG) Serial.println("Cannot log to sheet: WiFi not connected or GAS_URL not set.");
+        if (DEBUG) Serial.println("[Network] Cannot log to sheet: WiFi not connected or GAS_URL not set.");
         return;
     }
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setInsecure(); // SSL証明書を検証しない
     HTTPClient http;
     String url = String(GAS_URL) + params;
-    if (DEBUG) { Serial.print("[HTTP] Requesting URL: "); Serial.println(url); }
+    
+    if (DEBUG) {
+        Serial.print("[Network] Requesting Google Sheet URL: ");
+        Serial.println(url);
+    }
+
     if (http.begin(client, url)) {
         http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
         int httpCode = http.GET();
+
         if (httpCode > 0) {
-            if(DEBUG) Serial.printf("[HTTP] GET... code: %d\n", httpCode);
-            if (httpCode == HTTP_CODE_OK && DEBUG) {
+            if (DEBUG) Serial.printf("[Network] Google Sheet GET... code: %d\n", httpCode);
+            if (httpCode == HTTP_CODE_OK) {
                 String payload = http.getString();
-                Serial.println("[HTTP] Response payload:"); Serial.println(payload);
-            }
-        } else {
-            if (DEBUG) Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
-        }
-        http.end();
-    } else {
-        if (DEBUG) Serial.printf("[HTTP] Unable to connect\n");
-    }
-}
-
-// GASにWoL指示を問い合わせるポーリング関数 (Core 1で実行)
-void pollWolFromGas() {
-    if (WiFi.status() != WL_CONNECTED || String(GAS_URL_WOL).startsWith("-----")) {
-        return; 
-    }
-    
-    WiFiClientSecure client;
-    HTTPClient http;
-    client.setInsecure();
-    String payload;
-    
-    if (DEBUG) Serial.print("Core 1: Polling GAS for WoL signal...");
-
-    String signalCheckUrl = String(GAS_URL_WOL) + "?action=signal";
-    if (http.begin(client, signalCheckUrl)) {
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        http.setTimeout(10000);
-        int httpCode = http.GET();
-
-        if (httpCode > 0) {
-            payload = http.getString();
-            if (DEBUG) Serial.printf(" -> Response: [%s]\n", payload.c_str());
-
-            if (payload == "TRIGGER") {
-                if (DEBUG) Serial.println("  -> Trigger detected! Getting command...");
-                http.end(); 
-
-                String commandGetUrl = String(GAS_URL_WOL) + "?action=command";
-                if (http.begin(client, commandGetUrl)) {
-                    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-                    http.setTimeout(10000);
-                    httpCode = http.GET();
-
-                    if (httpCode > 0) {
-                        payload = http.getString();
-                        if (DEBUG) Serial.printf("  -> Command received: [%s]\n", payload.c_str());
-                        
-                        if (payload == "デスクトップPC起動") {
-                            sendWakeOnLan(MAC_DESKTOP);
-                            if (multicore_fifo_wready()) {
-                                multicore_fifo_push_blocking(1);
-                            }
-                        } else if (payload == "サーバーPC起動") {
-                            sendWakeOnLan(MAC_SERVER);
-                            if (multicore_fifo_wready()) {
-                                multicore_fifo_push_blocking(2);
-                            }
-                        }
-                    } else {
-                        if (DEBUG) Serial.printf("  [HTTP] Command GET failed, error: %s\n", http.errorToString(httpCode).c_str());
-                    }
+                if (DEBUG) {
+                    Serial.println("[Network] Google Sheet Response payload:");
+                    Serial.println(payload);
                 }
             }
         } else {
-            if (DEBUG) Serial.printf(" -> [HTTP] Signal GET failed, error: %s\n", http.errorToString(httpCode).c_str());
+            if (DEBUG) Serial.printf("[Network] Google Sheet GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
         }
         http.end();
     } else {
-        if (DEBUG) Serial.printf("[HTTP] (WoL Poll) Unable to connect\n");
+        if (DEBUG) Serial.printf("[Network] Unable to connect\n");
     }
 }
 
+
 void resyncNtpTime() {
     State::system.ntpInitialized = false;
-    if (DEBUG) Serial.println("NTP Resync requested.");
+    if (DEBUG) Serial.println("[Network] NTP Resync requested.");
 }
 
 void sendLineTestMessage() {
@@ -1106,31 +1097,39 @@ void manualLogToSheet() {
 }
 
 void update() {
-    // 起動後の定期的なNTP再同期、サーバー機能、WiFi切断時再接続
-    handleConnection(); 
+    handleConnection();
     handleServerClient();
     checkWiFiConnection();
 }
 
 void init() {
     WiFi.mode(WIFI_STA);
+
     if (USE_STATIC_IP) {
-        if (DEBUG) Serial.println("Configuring static IP address...");
-        IPAddress local_IP(STATIC_IP_BYTES); IPAddress gateway(GATEWAY_BYTES);
-        IPAddress subnet(SUBNET_BYTES); IPAddress primaryDNS(PRIMARY_DNS_BYTES);
+        if (DEBUG) Serial.println("[Network] Configuring static IP address...");
+        IPAddress local_IP(STATIC_IP_BYTES);
+        IPAddress gateway(GATEWAY_BYTES);
+        IPAddress subnet(SUBNET_BYTES);
+        IPAddress primaryDNS(PRIMARY_DNS_BYTES);
         IPAddress secondaryDNS(SECONDARY_DNS_BYTES);
+        
         if (DEBUG) {
-            Serial.print("  IP Address: "); Serial.println(local_IP);
-            Serial.print("  Gateway:    "); Serial.println(gateway);
-            Serial.print("  Subnet Mask:"); Serial.println(subnet);
-            Serial.print("  DNS1:       "); Serial.println(primaryDNS);
-            Serial.print("  DNS2:       "); Serial.println(secondaryDNS);
+            Serial.print("  - IP Address: "); Serial.println(local_IP);
+            Serial.print("  - Gateway:    "); Serial.println(gateway);
+            Serial.print("  - Subnet Mask:"); Serial.println(subnet);
+            Serial.print("  - DNS1:       "); Serial.println(primaryDNS);
+            Serial.print("  - DNS2:       "); Serial.println(secondaryDNS);
         }
+
         WiFi.config(local_IP, gateway, subnet);
         WiFi.setDNS(primaryDNS, secondaryDNS);
-        if (DEBUG) Serial.println("Static IP configuration applied.");
+        
+        if (DEBUG) Serial.println("[Network] Static IP configuration applied.");
     }
-    if(connectToWiFi(true)) initOTA();
+
+    if(connectToWiFi(true)){
+        initOTA();
+    }
 }
 }
 
@@ -1147,106 +1146,168 @@ void addHistoryRecord(String type, int distance, const char* timestamp) {
     State::history.records[State::history.index].type = type;
     State::history.records[State::history.index].distance = distance;
     State::history.index = (State::history.index + 1) % HISTORY_SIZE;
-    if(State::history.count < HISTORY_SIZE) State::history.count++;
+    if(State::history.count < HISTORY_SIZE) {
+        State::history.count++;
+    }
 }
 
 void handleLightning() {
     State::lightningInterruptFlag = false;
+        
     delay(5);
     int intVal = State::lightning.readInterruptReg();
-    if(DEBUG) Serial.printf("Interrupt Register: 0x%02X\n", intVal);
+    if (DEBUG) Serial.printf("[Sensor] Interrupt Register: 0x%02X\n", intVal);
     
     char timestamp[20];
     if (intVal == 0x01 || intVal == 0x08) {
         time_t now = time(nullptr);
         if (now > 100000) {
             strftime(timestamp, sizeof(timestamp), "%m/%d %H:%M", localtime(&now));
+            strcpy(State::sensors.lastEventTime, timestamp);
         } else {
             strcpy(timestamp, "Time N/A");
+            strcpy(State::sensors.lastEventTime, timestamp);
         }
-        strcpy(State::sensors.lastEventTime, timestamp);
     }
 
     if (intVal == 0x01) {
+        if (DEBUG) Serial.println("[Sensor] Noise detected.");
         State::sensors.lastEventType = "Noise";
-        if (State::system.currentNoiseLevel < 7) {
+        if (State::system.as3935_initialized && State::system.currentNoiseLevel < 7) {
             State::system.currentNoiseLevel++;
             State::lightning.setNoiseLevel(State::system.currentNoiseLevel);
         }
         addHistoryRecord("Noise", 0, timestamp);
+
     } else if (intVal == 0x08) {
+        if (DEBUG) Serial.println("[Sensor] Lightning detected.");
         Utils::blinkLED("yellow", 2, 80);
         int distance = State::lightning.distanceToStorm();
         State::sensors.lastLightningDistance = distance;
         State::sensors.lastEventType = "Lightning";
+        
         addHistoryRecord("Lightning", distance, timestamp);
+
         State::system.pendingLightningLog = true;
     }
     State::system.forceMainScreenRedraw = true;
 }
 
-void checkInterrupts() {
+// 温湿度センサーの値を更新する
+void updateDht() {
+    if(State::system.dht20_initialized) {
+        float temp_raw = State::dht20.getTemperature();
+        float hum_raw = State::dht20.getHumidity();
+
+        if (!isnan(temp_raw) && !isnan(hum_raw)) {
+            State::sensors.temperature = round(temp_raw * 10.0) / 10.0;
+            
+            if (hum_raw >= 0 && hum_raw <= 1.0) {
+                hum_raw *= 100.0;
+            }
+            State::sensors.humidity = round(hum_raw * 10.0) / 10.0;
+            if (DEBUG) Serial.printf("[Sensor] DHT20 Read OK: T=%.1fC, H=%.1f%%\n", State::sensors.temperature, State::sensors.humidity);
+        } else {
+            if (DEBUG) Serial.println("[Sensor] Error: Failed to read from DHT sensor!");
+        }
+    }
+}
+
+void update() {
+    // 雷割り込みフラグの処理
     if (State::lightningInterruptFlag) {
         handleLightning();
     }
-}
 
-void updateDht() {
-    float temp_raw = State::dht20.getTemperature();
-    float hum_raw = State::dht20.getHumidity();
-
-    if (!isnan(temp_raw) && !isnan(hum_raw)) {
-        State::sensors.temperature = round(temp_raw * 10.0) / 10.0;
-        if (hum_raw >= 0 && hum_raw <= 1.0) hum_raw *= 100.0;
-        State::sensors.humidity = round(hum_raw * 10.0) / 10.0;
-        // センサー値が更新されたので、メイン画面のセンサー部分を再描画
-        State::system.forceMainScreenRedraw = true;
-    } else {
-        if (DEBUG) Serial.println("Failed to read from DHT sensor!");
+    // ★追加: タイマーで定期的に温湿度を更新
+    static unsigned long lastSensorRead = 0;
+    if (millis() - lastSensorRead > SENSOR_READ_INTERVAL_MS) {
+        lastSensorRead = millis();
+        if (DEBUG) Serial.println("[Sensor] Periodic sensor read triggered.");
+        updateDht();
     }
 }
 
+// センサーのキャリブレーションを実行する関数
 void calibrateSensor() {
     State::lcd.clear();
     Display::printLcdLine(0, "Calibrating...");
-    if (State::lightning.calibrateOsc()) {
-        Display::printLcdLine(1, "Calibration OK!");
-        if (DEBUG) Serial.println("Antenna tuning successful.");
+    if(State::system.as3935_initialized) {
+        if (State::lightning.calibrateOsc()) {
+            Display::printLcdLine(1, "Calibration OK!");
+            if (DEBUG) Serial.println("[Sensor] Antenna tuning successful.");
+        } else {
+            Display::printLcdLine(1, "Calibration FAILED!");
+            if (DEBUG) Serial.println("[Sensor] Antenna tuning failed.");
+        }
     } else {
-        Display::printLcdLine(1, "Calibration FAILED!");
-        if (DEBUG) Serial.println("Antenna tuning failed.");
+        Display::printLcdLine(1, "AS3935 not ready.");
     }
 }
 
 void init() {
-    if (State::dht20.begin() != 0) {
-        if (DEBUG) Serial.println("DHT20 Error!");
+    if (DEBUG) Serial.println("Initializing Sensors...");
+
+    // --- DHT20 Initialization ---
+    if (DEBUG) Serial.print("  - Scanning for DHT20 at I2C address 0x38... ");
+    Wire.beginTransmission(0x38); // DHT20のI2Cアドレス
+    byte dht_error = Wire.endTransmission();
+
+    if (dht_error == 0) {
+        if (DEBUG) Serial.println("Device found.");
+        if (DEBUG) Serial.print("    - Calling dht20.begin()... ");
+        if (State::dht20.begin() == 0) {
+            if (DEBUG) Serial.println("OK.");
+            State::system.dht20_initialized = true;
+        } else {
+            if (DEBUG) Serial.println("FAILED.");
+            Display::printLcdLine(1, "DHT20 Init FAILED");
+        }
+    } else {
+        if (DEBUG) {
+            Serial.print("Device NOT found (error code: ");
+            Serial.print(dht_error);
+            Serial.println(").");
+        }
+        Display::printLcdLine(1, "DHT20 NOT FOUND!");
     }
     
-    State::system.currentNoiseLevel = INITIAL_NOISE_LEVEL;
-    if (!State::lightning.begin(Wire)) {
-        if (DEBUG) Serial.println("AS3935 Error!");
-    } else {
-        State::lightning.resetSettings();
-        State::lightning.setIndoorOutdoor(OUTDOOR);
-        State::lightning.setNoiseLevel(State::system.currentNoiseLevel);
-        State::lightning.watchdogThreshold(LIGHTNING_WATCHDOG_THRESHOLD);
-        State::lightning.spikeRejection(LIGHTNING_SPIKE_REJECTION);
-        if (DEBUG) {
-            Serial.println("--- AS3935 Initial Settings ---");
-            Serial.printf("Watchdog Threshold: Set to %d, Read back %d\n", LIGHTNING_WATCHDOG_THRESHOLD, State::lightning.readWatchdogThreshold());
-            Serial.printf("Spike Rejection:    Set to %d, Read back %d\n", LIGHTNING_SPIKE_REJECTION, State::lightning.readSpikeRejection());
-            Serial.printf("Noise Level:        Set to %d, Read back %d\n", State::system.currentNoiseLevel, State::lightning.readNoiseLevel());
-            Serial.println("---------------------------------");
+    delay(100); 
+
+    // --- AS3935 Initialization ---
+    if (DEBUG) Serial.print("  - Scanning for AS3935 at I2C address 0x03... ");
+    Wire.beginTransmission(Pins::AS3935_ADDR);
+    byte as3935_error = Wire.endTransmission();
+
+    if (as3935_error == 0) {
+        if (DEBUG) Serial.println("Device found.");
+        if (DEBUG) Serial.print("    - Calling lightning.begin()... ");
+        if (State::lightning.begin(Wire)) {
+            if (DEBUG) Serial.println("OK.");
+            State::system.as3935_initialized = true;
+            if (DEBUG) Serial.println("    - Configuring AS3935 sensor...");
+            State::lightning.resetSettings();
+            State::lightning.setIndoorOutdoor(OUTDOOR);
+            State::lightning.setNoiseLevel(INITIAL_NOISE_LEVEL);
+            State::system.currentNoiseLevel = INITIAL_NOISE_LEVEL;
+            State::lightning.watchdogThreshold(LIGHTNING_WATCHDOG_THRESHOLD);
+            State::lightning.spikeRejection(LIGHTNING_SPIKE_REJECTION);
+            if (DEBUG) Serial.println("    - Configuration complete.");
+        } else {
+            if (DEBUG) Serial.println("FAILED.");
+            Display::printLcdLine(2, "AS3935 Init FAILED");
         }
+    } else {
+        if (DEBUG) {
+            Serial.print("Device NOT found (error code: ");
+            Serial.print(as3935_error);
+            Serial.println(").");
+        }
+        Display::printLcdLine(2, "AS3935 NOT FOUND!");
     }
 
-    // ★修正: 起動直後の誤検知防止のため、割り込みを有効にする前に待機
-    if (DEBUG) Serial.println("Waiting 2 seconds for AS3935 to stabilize before enabling interrupts...");
-    delay(2000);
-
     attachInterrupt(digitalPinToInterrupt(Pins::LIGHTNING_IRQ), handleLightningInterrupt, RISING);
-    if (DEBUG) Serial.println("AS3935 interrupt attached.");
+    if (DEBUG) Serial.println("Sensor Initialization Complete.");
 }
 }
 
@@ -1263,10 +1324,15 @@ bool longPressTriggered = false;
 
 void handleButton() {
     int reading = digitalRead(Pins::BUTTON);
-    if (reading != lastButtonState) lastDebounceTime = millis();
+
+    if (reading != lastButtonState) {
+        lastDebounceTime = millis();
+    }
+
     if ((millis() - lastDebounceTime) > debounceDelay) {
         if (reading != buttonState) {
             buttonState = reading;
+
             if (buttonState == LOW) {
                 buttonPressTime = millis();
                 longPressTriggered = false;
@@ -1280,7 +1346,7 @@ void handleButton() {
                             State::timers.backlightOn = millis();
                         }
                     } else if (State::menu.currentMode == State::HISTORY || State::menu.currentMode == State::SENSOR_DIAGNOSTICS) {
-                        // 短押しは無効
+                        // これらの画面では短押しは無効
                     } else {
                         int count = 0, currentSelection = 0;
                         Menu::getCurrentMenu(count, currentSelection);
@@ -1296,18 +1362,26 @@ void handleButton() {
             }
         }
     }
+
     if (buttonState == LOW && !longPressTriggered && (millis() - buttonPressTime > LONG_PRESS_DURATION_MS)) {
         longPressTriggered = true;
         State::timers.lastActivity = millis();
         State::system.needsRedraw = true;
         switch (State::menu.currentMode) {
-            case State::MAIN_DISPLAY: Menu::changeMode(State::MENU); break;
-            case State::HISTORY: case State::ULTRASONIC_MONITOR: case State::SENSOR_DIAGNOSTICS:
-                Menu::changeMode(State::MAIN_DISPLAY); break;
+            case State::MAIN_DISPLAY:
+                Menu::changeMode(State::MENU);
+                break;
+            case State::HISTORY:
+            case State::ULTRASONIC_MONITOR:
+            case State::SENSOR_DIAGNOSTICS:
+                Menu::changeMode(State::MAIN_DISPLAY);
+                break;
             default: {
                 int count = 0, currentSelection = 0;
                 const Menu::MenuItem* menu = Menu::getCurrentMenu(count, currentSelection);
-                if (menu && currentSelection < count) menu[currentSelection].action();
+                if (menu && currentSelection < count) {
+                    menu[currentSelection].action();
+                }
                 break;
             }
         }
@@ -1326,18 +1400,30 @@ void changeMode(State::Mode newMode) {
     State::menu.commandSelection = 0;
     State::system.needsRedraw = true;
     State::timers.lastActivity = millis();
-    if (newMode == State::MAIN_DISPLAY) State::system.forceMainScreenRedraw = true;
+    if (newMode == State::MAIN_DISPLAY) {
+        State::system.forceMainScreenRedraw = true;
+    }
 }
 
 void performMenuAction(void (*action)(), bool returnToMain) {
-    if (action) { action(); delay(1500); }
-    if (returnToMain) changeMode(State::MAIN_DISPLAY);
-    else State::system.needsRedraw = true;
+    if (action) {
+        action();
+        delay(1500); // 結果表示のために少し待機
+    }
+    if (returnToMain) {
+        changeMode(State::MAIN_DISPLAY);
+    } else {
+        State::system.needsRedraw = true;
+    }
 }
 
 void checkInactivity() {
-    if (State::menu.currentMode == State::MAIN_DISPLAY || State::menu.currentMode == State::ULTRASONIC_MONITOR || State::menu.currentMode == State::SENSOR_DIAGNOSTICS) return;
-    if (millis() - State::timers.lastActivity > INACTIVITY_TIMEOUT_MS) changeMode(State::MAIN_DISPLAY);
+    if (State::menu.currentMode == State::MAIN_DISPLAY || State::menu.currentMode == State::ULTRASONIC_MONITOR || State::menu.currentMode == State::SENSOR_DIAGNOSTICS) {
+        return;
+    }
+    if (millis() - State::timers.lastActivity > INACTIVITY_TIMEOUT_MS) {
+        changeMode(State::MAIN_DISPLAY);
+    }
 }
 }
 
@@ -1347,42 +1433,51 @@ void checkInactivity() {
 void handlePeriodicTasks() {
     static int lastSyncMinute = -1;
     static int lastLogMinute = -1;
-    if (!State::system.ntpInitialized || time(nullptr) < 100000) return;
+
+    if (!State::system.ntpInitialized || time(nullptr) < 100000) {
+        return;
+    }
+
     time_t now = time(nullptr);
     struct tm *timeinfo = localtime(&now);
     int currentMinute = timeinfo->tm_min;
+
     if (!State::system.initialLogSent) {
         if (State::sensors.temperature > -100) {
             String params = Network::createTempHumParams();
             if (params != "") {
-                if(DEBUG) Serial.println("Core 0: Task -> Logging initial Temp/Hum data to sheet.");
+                if (DEBUG) Serial.println("[Task] Initial log of Temp/Hum data.");
                 Network::logDataToGoogleSheet(params);
                 State::system.initialLogSent = true;
                 lastLogMinute = currentMinute;
             }
         }
     }
+
     if (currentMinute % 4 == 0) {
         if (currentMinute != lastSyncMinute) {
-            if(DEBUG) Serial.println("Core 0: Task -> Performing scheduled NTP resync.");
             lastSyncMinute = currentMinute;
             State::system.isAutoResync = true;
             Network::resyncNtpTime();
         }
     }
+
+    // 10分ごとの記録
     if (currentMinute % 10 == 0) {
         if (currentMinute != lastLogMinute) {
-            if(DEBUG) Serial.println("Core 0: Task -> Performing scheduled Temp/Hum logging to sheet.");
             lastLogMinute = currentMinute;
             String params = Network::createTempHumParams();
-            if (params != "") Network::logDataToGoogleSheet(params);
+            if (params != "") {
+                if (DEBUG) Serial.println("[Task] 10-minute interval: Logging Temp/Hum data.");
+                Network::logDataToGoogleSheet(params);
+            }
         }
     }
 }
 
 void handlePendingNetworkTasks() {
     if (State::system.pendingLightningLog && WiFi.status() == WL_CONNECTED) {
-        if(DEBUG) Serial.println("Core 0: Handling pending lightning log and notification.");
+        if (DEBUG) Serial.println("[Task] Pending lightning event found. Sending notifications...");
         int distance = State::sensors.lastLightningDistance;
         char msg[60];
         snprintf(msg, sizeof(msg), "雷を検知しました！\n距離: 約%dkm", distance);
@@ -1394,148 +1489,64 @@ void handlePendingNetworkTasks() {
 }
 
 //================================================================
-// Core 1 (WoL ポーリング専用)
-//================================================================
-void core1_entry() {
-    if (DEBUG) {
-        Serial.println("Core 1: Ready and waiting for WoL check signals from Core 0.");
-    }
-
-    // このループはCore 1で永続的に実行される
-    while(true) {
-        // Core 0からの合図を待つ (FIFOからデータを読み取るまで処理を停止)
-        multicore_fifo_pop_blocking(); 
-        if(DEBUG) Serial.println("Core 1: Received trigger from Core 0.");
-        // 合図を受け取ったら、WoLのポーリングを実行
-        Network::pollWolFromGas();
-    }
-}
-
-
-//================================================================
-// Setup & Loop (Core 0)
+// Setup & Loop
 //================================================================
 void setup() {
     Serial.begin(115200);
-    // シリアルモニタが開くのを5秒間待つ
-    while (!Serial && millis() < 5000);
-    if (DEBUG) Serial.println("--- System Booting on Core 0 ---");
+    delay(2000);
+    if (DEBUG) Serial.println("--- System Booting ---");
 
+    if (DEBUG) Serial.println("Initializing Pins...");
     pinMode(Pins::LCD_BACKLIGHT, OUTPUT);
-    pinMode(Pins::LED_R, OUTPUT); pinMode(Pins::LED_G, OUTPUT); pinMode(Pins::LED_B, OUTPUT);
+    pinMode(Pins::LED_R, OUTPUT);
+    pinMode(Pins::LED_G, OUTPUT);
+    pinMode(Pins::LED_B, OUTPUT);
     pinMode(Pins::BUTTON, INPUT_PULLUP);
     pinMode(Pins::LIGHTNING_IRQ, INPUT);
-    Wire.setSDA(Pins::I2C_SDA); Wire.setSCL(Pins::I2C_SCL);
+    if (DEBUG) Serial.println("Initializing I2C...");
+    Wire.setSDA(Pins::I2C_SDA);
+    Wire.setSCL(Pins::I2C_SCL);
     Wire.begin();
+    if (DEBUG) Serial.println("Pin & I2C Initialization Complete.");
 
-    // ★修正: 起動シーケンス中はバックライトとLEDを白色に点灯
     digitalWrite(Pins::LCD_BACKLIGHT, HIGH);
-    Utils::setRGB(255, 255, 255);
+    if (DEBUG) Serial.println("Initializing Display...");
     Display::init();
+    if (DEBUG) Serial.println("Display Initialization Complete.");
 
-    Sensors::init();
-    Network::init(); // WiFi接続など
-    
-    // ★★★ フリーズ対策: 起動シーケンスの順序を修正 ★★★
-    // WiFi接続が確立したら、まず初回のNTP同期を行う
-    if (WiFi.status() == WL_CONNECTED) {
-        Network::handleConnection(); // この中でNTP同期が完了するまで待機する
-
-        // NTP同期が成功した場合のみCore 1を起動
-        if (State::system.ntpInitialized) {
-            multicore_launch_core1(core1_entry);
-            multicore_fifo_drain(); 
-            if (DEBUG) Serial.println("Core 1 for WoL polling has been launched.");
-        } else {
-            if (DEBUG) Serial.println("NTP sync failed. Core 1 will not be launched.");
-        }
-    } else {
-        if (DEBUG) Serial.println("WiFi connection failed. Core 1 will not be launched.");
-    }
-
-    Menu::changeMode(State::MAIN_DISPLAY);
-    if (DEBUG) Serial.println("--- Core 0 Boot Complete ---");
-
-    // ★追加: 起動完了後、LEDを消灯し、バックライトを通常モードに戻す
+    Utils::setRGB(255, 255, 255);
+    delay(1000);
     Utils::setRGB(0, 0, 0);
     if (!State::system.backlightAlwaysOn) {
         digitalWrite(Pins::LCD_BACKLIGHT, LOW);
     }
+    
+    Sensors::init();
+    
+    if (DEBUG) Serial.println("Initializing Network...");
+    Network::init();
+    if (DEBUG) Serial.println("Network Initialization Complete.");
+    
+    Menu::changeMode(State::MAIN_DISPLAY);
+    if (DEBUG) Serial.println("--- Boot Complete ---");
 }
 
 void loop() {
-    // 常に実行するタスク (応答性が重要)
     ArduinoOTA.handle();
+
     Input::handleButton();
-    Network::update(); // NTP(再接続時), サーバークライアント, WiFi接続維持
-    Sensors::checkInterrupts(); // 雷割り込みフラグのチェック
-
-    // ★修正: WoLメッセージの表示時間管理とLED消灯処理
-    if (State::wolMessage != "" && millis() - State::wolMessageDisplayTime >= 3000) {
-        if (DEBUG) Serial.println("Core 0: WoL message timeout. Clearing message and LED.");
-        State::wolMessage = "";
-        State::system.forceMainScreenRedraw = true;
-        // イルミネーションモードがOFFの場合のみLEDを消灯する
-        if (!State::system.illuminationOn) {
-            Utils::setRGB(0, 0, 0);
-        }
-    }
-
+    Network::update();
+    Sensors::update();
     Display::update();
     Menu::checkInactivity();
+
     handlePeriodicTasks();
     handlePendingNetworkTasks();
-    if (State::system.illuminationOn) Utils::handleSmoothIllumination();
 
-    // Core1からのWoL実行通知をチェック
-    if (multicore_fifo_rvalid()) {
-        uint32_t command = multicore_fifo_pop_blocking();
-        if (DEBUG) Serial.printf("Core 0: Received WoL command %d from Core 1.\n", command);
-
-        if (command == 1) { // 1: Desktop
-            State::wolMessage = "Desktop PC Started";
-        } else if (command == 2) { // 2: Server
-            State::wolMessage = "Server PC Started";
-        }
-        State::wolMessageDisplayTime = millis();
-        State::system.forceMainScreenRedraw = true; // 画面をすぐに更新
-        // ★修正: WoL起動時のLEDをよりオレンジ色に調整 (R:255, G:80, B:0)
-        Utils::setRGB(255, 80, 0);
+    if (State::system.illuminationOn) {
+        Utils::handleSmoothIllumination();
     }
 
-    // 4秒サイクルのタスク実行ロジック
-    static unsigned long lastCycleStartMillis = 0;
-    static bool wolCheckedThisCycle = false;
-    unsigned long currentMillis = millis();
-
-    // 2秒ごとの温湿度センサー読み取り
-    static unsigned long lastDhtReadMillis = 0;
-    if (currentMillis - lastDhtReadMillis >= 2000) {
-        lastDhtReadMillis = currentMillis;
-        if(DEBUG) Serial.println("Core 0: Task -> Reading DHT sensor.");
-        Sensors::updateDht();
-    }
-
-    // 4秒サイクルの開始を検知
-    if (currentMillis - lastCycleStartMillis >= 4000) {
-        lastCycleStartMillis = currentMillis;
-        wolCheckedThisCycle = false; // 新しいサイクルなのでWoLチェックフラグをリセット
-    }
-
-    // サイクル開始から2秒経過後、まだこのサイクルでWoLチェックをしていなければ実行
-    if (!wolCheckedThisCycle && (currentMillis - lastCycleStartMillis >= 2000)) {
-        if(WiFi.status() == WL_CONNECTED){
-            if (multicore_fifo_wready()) { 
-                if(DEBUG) Serial.println("Core 0: Task -> Triggering Core 1 for WoL check.");
-                multicore_fifo_push_blocking(0); // 0はWoLチェックの合図
-                wolCheckedThisCycle = true; // このサイクルではチェック済み
-            } else {
-                if (DEBUG) Serial.println("Core 0: FIFO full, cannot trigger Core 1 this cycle.");
-            }
-        }
-    }
-
-    // バックライトのタイムアウト処理
     if (State::menu.currentMode == State::MAIN_DISPLAY && !State::system.backlightAlwaysOn &&
         State::timers.backlightOn > 0 && (millis() - State::timers.backlightOn > BACKLIGHT_DURATION_MS)) {
         digitalWrite(Pins::LCD_BACKLIGHT, LOW);
